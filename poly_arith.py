@@ -5,13 +5,17 @@ Representation:
   coeffs: torch.Tensor with shape (deg+1, *primal_shape)
   P(z) = sum_{k=0..deg} coeffs[k] * z^k
 
-This file intentionally knows nothing about PolyTensor or dispatch; it only
-implements arithmetic on coefficient tensors (plain torch.Tensors).
+This file knows nothing about __torch_dispatch__ or PolyTensor; it only implements
+operations on coefficient tensors (plain torch.Tensor objects).
+
+Adds:
+  - cauchy_bilinear: generic bilinear Cauchy product for ops like matmul/conv2d
+  - taylor_unary: compose an elementwise analytic function using its Taylor series
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence, Tuple
+from typing import Callable, Sequence, Tuple
 
 import torch
 
@@ -103,7 +107,7 @@ def neg(a: torch.Tensor) -> torch.Tensor:
 
 def mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
-    Truncated Cauchy product (O(deg^2)).
+    Truncated Cauchy product (O(deg^2)) for elementwise multiplication.
 
     out[n] = sum_{k=0..n} a[k] * b[n-k]
     """
@@ -127,85 +131,60 @@ def mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def add_(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def cauchy_bilinear(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bilinear: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """
+    Truncated Cauchy product for a generic bilinear op ⊗:
+
+        out[n] = sum_{k=0..n} bilinear(a[k], b[n-k])
+    """
     _check_coeffs(a)
     _check_coeffs(b)
     if a.shape[0] != b.shape[0]:
         raise ValueError(f"Degree mismatch: {degree(a)} vs {degree(b)}")
-    for k in range(a.shape[0]):
-        a[k].add_(b[k])
-    return a
+
+    deg = a.shape[0] - 1
+    out_slices = []
+    for n in range(deg + 1):
+        acc = None
+        for k in range(n + 1):
+            term = bilinear(a[k], b[n - k])
+            acc = term if acc is None else (acc + term)
+        if acc is None:
+            raise RuntimeError("cauchy_bilinear: internal error (acc=None)")
+        out_slices.append(acc)
+    return torch.stack(out_slices, dim=0)
 
 
-def sub_(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    _check_coeffs(a)
-    _check_coeffs(b)
-    if a.shape[0] != b.shape[0]:
-        raise ValueError(f"Degree mismatch: {degree(a)} vs {degree(b)}")
-    for k in range(a.shape[0]):
-        a[k].sub_(b[k])
-    return a
-
-
-def mul_(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def taylor_unary(coeffs: torch.Tensor, taylor_over_fact: Sequence[torch.Tensor]) -> torch.Tensor:
     """
-    In-place ring multiplication requires a temporary.
-    """
-    prod = mul(a, b)
-    a.copy_(prod)
-    return a
+    Compose an elementwise analytic function using its Taylor series around the
+    constant term.
 
-
-def neg_(a: torch.Tensor) -> torch.Tensor:
-    _check_coeffs(a)
-    a.neg_()
-    return a
-
-
-def sum_to_shape(x: torch.Tensor, target_shape: Sequence[int]) -> torch.Tensor:
-    """
-    Reduce x by summing over broadcasted dims so that result has shape target_shape.
-
-    This mimics the common "sum_to_size" logic used in broadcasting backwards.
-    """
-    tgt = tuple(int(s) for s in target_shape)
-    if tuple(x.shape) == tgt:
-        return x
-
-    x_shape = tuple(x.shape)
-    if len(tgt) > len(x_shape):
-        raise ValueError(f"target_shape {tgt} has more dims than x.shape {x_shape}")
-
-    # Align target shape to x by left-padding with ones.
-    pad = len(x_shape) - len(tgt)
-    aligned = (1,) * pad + tgt
-
-    # Identify dims to sum over.
-    dims = []
-    for i, (xs, ts) in enumerate(zip(x_shape, aligned)):
-        if ts == 1 and xs != 1:
-            dims.append(i)
-        elif i < pad:
-            dims.append(i)
-
-    if dims:
-        x = x.sum(dim=tuple(dims), keepdim=True)
-
-    # Now x has same ndim as before, with 1s in reduced dims.
-    x = x.reshape(aligned)
-    if pad:
-        x = x.reshape(tgt)
-    return x
-
-
-def sum_to_shape_coeffs(coeffs: torch.Tensor, target_shape: Sequence[int]) -> torch.Tensor:
-    """
-    Apply sum_to_shape to each coefficient slice.
+    Input:
+      coeffs: (deg+1, *shape), x(z)
+      taylor_over_fact: list length deg+1 with entries:
+         taylor_over_fact[n] = f^{(n)}(x0) / n!   (elementwise tensors)
     """
     _check_coeffs(coeffs)
-    deg = coeffs.shape[0] - 1
-    tgt = tuple(int(s) for s in target_shape)
-    out = []
-    for k in range(deg + 1):
-        out.append(sum_to_shape(coeffs[k], tgt))
-    return torch.stack(out, dim=0)
+    deg = degree(coeffs)
+    if len(taylor_over_fact) != deg + 1:
+        raise ValueError(f"Expected {deg+1} Taylor coefficients, got {len(taylor_over_fact)}")
+
+    # δ = x - x0
+    delta = coeffs.clone()
+    delta[0] = torch.zeros_like(delta[0])
+
+    # pow = δ^0 = 1
+    pow_coeffs = torch.zeros_like(coeffs)
+    pow_coeffs[0] = torch.ones_like(coeffs[0])
+
+    out = torch.zeros_like(coeffs)
+    for n in range(deg + 1):
+        out = out + pow_coeffs * taylor_over_fact[n]
+        if n < deg:
+            pow_coeffs = mul(pow_coeffs, delta)
+    return out
