@@ -211,6 +211,18 @@ class PolyTensor(torch.Tensor):
 
             return Y
 
+        def poly_sqrt(X):
+            Y = [None] * (D + 1)
+            Y[0] = torch.sqrt(X[0])
+
+            for k in range(1, D + 1):
+                s = torch.zeros_like(X[0])
+                for i in range(1, k):
+                    s = s + Y[i] * Y[k - i]
+                Y[k] = (X[k] - s) / (2 * Y[0])
+
+            return Y
+
         def poly_log_softmax(X, dim):
             M = X[0].max(dim=dim, keepdim=True).values
             Z = [X[0] - M] + list(X[1:])
@@ -340,6 +352,15 @@ class PolyTensor(torch.Tensor):
                 return wrap(a * c for c in b.coeffs)
             return wrap(conv(lift(a), lift(b)))
 
+        if func in (aten.div.Tensor, aten.div.Scalar):
+            a, b = args[:2]
+            rounding_mode = kwargs.get("rounding_mode")
+            if rounding_mode is not None:
+                raise NotImplementedError("PolyTensor does not implement rounded division")
+            if is_poly(a) and not is_poly(b):
+                return wrap(c / b for c in a.coeffs)
+            return wrap(conv(lift(a), poly_reciprocal(lift(b))))
+
         if func is aten.mm.default:
             return wrap(bilinear(torch.mm, args[0], args[1]))
 
@@ -398,28 +419,35 @@ class PolyTensor(torch.Tensor):
             a, b = args[:2]
             alpha = kwargs.get("alpha", 1)
             if not is_poly(b):
-                a._set_coeffs((a.coeffs[0] + alpha * b, *a.coeffs[1:]))
+                for coeff in a.coeffs:
+                    coeff.add_(b, alpha=alpha)
                 return a
             A, B = lift(a), lift(b)
-            a._set_coeffs(A[k] + alpha * B[k] for k in range(D + 1))
+            for k in range(D + 1):
+                A[k].add_(B[k], alpha=alpha)
             return a
 
         if func in (aten.sub_.Tensor, aten.sub_.Scalar):
             a, b = args[:2]
             alpha = kwargs.get("alpha", 1)
             if not is_poly(b):
-                a._set_coeffs((a.coeffs[0] - alpha * b, *a.coeffs[1:]))
+                for coeff in a.coeffs:
+                    coeff.sub_(b, alpha=alpha)
                 return a
             A, B = lift(a), lift(b)
-            a._set_coeffs(A[k] - alpha * B[k] for k in range(D + 1))
+            for k in range(D + 1):
+                A[k].sub_(B[k], alpha=alpha)
             return a
 
         if func in (aten.mul_.Tensor, aten.mul_.Scalar):
             a, b = args[:2]
             if not is_poly(b):
-                a._set_coeffs(c * b for c in a.coeffs)
+                for coeff in a.coeffs:
+                    coeff.mul_(b)
                 return a
-            a._set_coeffs(conv(lift(a), lift(b)))
+            out = conv(lift(a), lift(b))
+            for dst, src in zip(a.coeffs, out):
+                dst.copy_(src)
             return a
 
         if func is aten.exp.default:
@@ -427,6 +455,9 @@ class PolyTensor(torch.Tensor):
 
         if func is aten.log.default:
             return wrap(poly_log(lift(args[0])))
+
+        if func is aten.sqrt.default:
+            return wrap(poly_sqrt(lift(args[0])))
 
         if func is aten.sigmoid.default:
             return wrap(poly_sigmoid(lift(args[0])))
@@ -663,7 +694,8 @@ class PolyTensor(torch.Tensor):
 
         if func is aten.zero_.default:
             x = args[0]
-            x._set_coeffs(torch.zeros_like(c) for c in lift(x))
+            for coeff in lift(x):
+                coeff.zero_()
             return x
 
         if func is aten.copy_.default:
@@ -682,6 +714,9 @@ class PolyTensor(torch.Tensor):
             aten.as_strided.default,
             aten.slice.Tensor,
             aten.select.int,
+            aten.unsqueeze.default,
+            aten.squeeze.dim,
+            aten.squeeze.default,
         ):
             return wrap(func(c, *args[1:], **kwargs).clone() for c in lift(args[0]))
 

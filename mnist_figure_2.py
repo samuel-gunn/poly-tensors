@@ -24,13 +24,13 @@ import matplotlib.pyplot as plt
 
 
 DATA_DIR = "data"
-OUTPUT_PATH = "mnist_figure_2.png"
+OUTPUT_PATH = "results/mnist_figure_2.png"
 BATCH_SIZE = 64
 EPOCHS = 2
 LEARNING_RATE = 1e-3
 DOWNWEIGHT_FRACTION = 0.05
 DEGREE = 3
-NUM_DOTS = 11
+NUM_DOTS = 6
 SEED = 0
 
 
@@ -160,7 +160,8 @@ def train_one_epoch(model, loader, selected, downweight, loss_fn, optimizer, dev
     correct = 0
     total = 0
 
-    for images, labels, indices in tqdm(loader, disable=quiet, leave=False):
+    progress = tqdm(loader, disable=quiet, leave=False)
+    for images, labels, indices in progress:
         images = images.to(device)
         labels = labels.to(device)
         selected_batch = selected[indices].to(device)
@@ -178,6 +179,8 @@ def train_one_epoch(model, loader, selected, downweight, loss_fn, optimizer, dev
         total_loss += tensor_value(loss).item() * batch_size
         correct += (tensor_value(logits).argmax(dim=1) == labels).sum().item()
         total += batch_size
+        if hasattr(progress, "set_postfix"):
+            progress.set_postfix(train_loss=f"{total_loss / total:.4f}")
 
     return total_loss / total, correct / total
 
@@ -244,8 +247,14 @@ def retrained_losses(train_data, selected, test_image, test_label, epoch_indices
     for z in zs:
         print(f"retraining empirical model at z={z:.2f}")
         model = make_model(device, args.seed + 40)
+        if z == 0.0:
+            before_loss = test_loss(model, test_image, test_label, device).detach().cpu().item()
+            print(f"  z=0 eval loss before training: {before_loss:.4f}")
         train_model(model, train_data, selected, z, epoch_indices, args, device)
-        losses.append(test_loss(model, test_image, test_label, device).detach().cpu().item())
+        after_loss = test_loss(model, test_image, test_label, device).detach().cpu().item()
+        if z == 0.0:
+            print(f"  z=0 eval loss after training: {after_loss:.4f}")
+        losses.append(after_loss)
 
     return zs, losses
 
