@@ -1,7 +1,6 @@
 import math
 
 import torch
-import torch.nn.functional as F
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
 aten = torch.ops.aten
@@ -77,59 +76,7 @@ class PolyTensor(torch.Tensor):
             return f"PolyTensor(<uninitialized>, requires_grad={self.requires_grad})"
         return f"PolyTensor({self.coeffs}, requires_grad={self.requires_grad})"
 
-    def flatten(self, start_dim=0, end_dim=-1):
-        return PolyTensor(
-            tuple(c.flatten(start_dim, end_dim).clone() for c in self.coeffs),
-            requires_grad=self.requires_grad,
-        )
-
-    def transpose(self, dim0, dim1):
-        return PolyTensor(
-            tuple(c.transpose(dim0, dim1).clone() for c in self.coeffs),
-            requires_grad=self.requires_grad,
-        )
-
-    def t(self):
-        return PolyTensor(tuple(c.t().clone() for c in self.coeffs), requires_grad=self.requires_grad)
-
-    def view(self, *shape):
-        return PolyTensor(tuple(c.view(*shape).clone() for c in self.coeffs), requires_grad=self.requires_grad)
-
-    def reshape(self, *shape):
-        return PolyTensor(tuple(c.reshape(*shape).clone() for c in self.coeffs), requires_grad=self.requires_grad)
-
-    @classmethod
-    def __torch_function__(cls, func, types, args=(), kwargs=None):
-        kwargs = {} if kwargs is None else kwargs
-        name = getattr(func, "__name__", "")
-
-        if func is F.linear or name == "linear":
-            return _poly_linear(*args, **kwargs)
-
-        if func is F.gelu or name == "gelu":
-            approximate = args[1] if len(args) > 1 else kwargs.get("approximate", "none")
-            return _poly_gelu(args[0], approximate)
-
-        if name == "flatten":
-            return PolyTensor.flatten(args[0], *args[1:], **kwargs)
-
-        if name == "transpose":
-            return PolyTensor.transpose(args[0], *args[1:], **kwargs)
-
-        if name == "t":
-            return PolyTensor.t(args[0])
-
-        if name == "view":
-            return PolyTensor.view(args[0], *args[1:], **kwargs)
-
-        if name == "reshape":
-            return PolyTensor.reshape(args[0], *args[1:], **kwargs)
-
-        if func is torch.matmul and args[0].dim() == 2 and args[1].dim() == 2:
-            return _poly_mm(args[0], args[1])
-
-        with torch._C.DisableTorchFunctionSubclass():
-            return func(*args, **kwargs)
+    __torch_function__ = torch._C._disabled_torch_function_impl
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
@@ -166,7 +113,7 @@ class PolyTensor(torch.Tensor):
         def wrap(cs):
             return PolyTensor(
                 tuple(c.clone() if isinstance(c, torch.Tensor) else c for c in cs),
-                requires_grad=any(p.requires_grad for p in polys),
+                requires_grad=False,
             )
 
         def correct(out):
@@ -252,6 +199,18 @@ class PolyTensor(torch.Tensor):
 
             return Y
 
+        def poly_reciprocal(X):
+            Y = [None] * (D + 1)
+            Y[0] = 1 / X[0]
+
+            for k in range(1, D + 1):
+                s = X[1] * Y[k - 1]
+                for i in range(2, k + 1):
+                    s = s + X[i] * Y[k - i]
+                Y[k] = -s / X[0]
+
+            return Y
+
         def poly_log_softmax(X, dim):
             M = X[0].max(dim=dim, keepdim=True).values
             Z = [X[0] - M] + list(X[1:])
@@ -261,8 +220,20 @@ class PolyTensor(torch.Tensor):
             L[0] = L[0] + M
             return [X[k] - L[k] for k in range(D + 1)]
 
+        def poly_softmax(X, dim):
+            M = X[0].max(dim=dim, keepdim=True).values
+            Z = [X[0] - M] + list(X[1:])
+            E = poly_exp(Z)
+            S = [e.sum(dim=dim, keepdim=True) for e in E]
+            return conv(E, poly_reciprocal(S))
+
         def poly_one(like):
             return [torch.ones_like(like)] + [torch.zeros_like(like) for _ in range(D)]
+
+        def poly_sigmoid(X):
+            E = poly_exp([-x for x in X])
+            denominator = [1 + E[0]] + E[1:]
+            return poly_reciprocal(denominator)
 
         def poly_tanh(X):
             Y = [None] * (D + 1)
@@ -370,11 +341,9 @@ class PolyTensor(torch.Tensor):
             return wrap(conv(lift(a), lift(b)))
 
         if func is aten.mm.default:
-            return _poly_mm(args[0], args[1])
+            return wrap(bilinear(torch.mm, args[0], args[1]))
 
         if func is aten.matmul.default:
-            if args[0].dim() == 2 and args[1].dim() == 2:
-                return _poly_mm(args[0], args[1])
             return correct(wrap(bilinear(torch.matmul, args[0], args[1])))
 
         if func is aten.bmm.default:
@@ -459,6 +428,16 @@ class PolyTensor(torch.Tensor):
         if func is aten.log.default:
             return wrap(poly_log(lift(args[0])))
 
+        if func is aten.sigmoid.default:
+            return wrap(poly_sigmoid(lift(args[0])))
+
+        if func is aten.tanh.default:
+            return wrap(poly_tanh(lift(args[0]))[0])
+
+        if func is aten.silu.default:
+            X = lift(args[0])
+            return wrap(conv(X, poly_sigmoid(X)))
+
         if func is aten.gelu.default:
             approximate = args[1] if len(args) > 1 else kwargs.get("approximate", "none")
             return wrap(poly_gelu(lift(args[0]), approximate))
@@ -467,6 +446,17 @@ class PolyTensor(torch.Tensor):
             dim = args[1] if len(args) > 1 else kwargs["dim"]
             return wrap(poly_log_softmax(lift(args[0]), dim))
 
+        if func is aten._softmax.default:
+            dim = args[1] if len(args) > 1 else kwargs["dim"]
+            half_to_float = args[2] if len(args) > 2 else kwargs.get("half_to_float", False)
+            if half_to_float:
+                raise NotImplementedError("PolyTensor does not implement half_to_float softmax")
+            return wrap(poly_softmax(lift(args[0]), dim))
+
+        if func is aten.embedding.default:
+            weight = args[0]
+            return wrap(func(w, *plain(args[1:]), **plain(kwargs)) for w in lift(weight))
+
         if func is aten.avg_pool2d.default:
             return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
 
@@ -474,7 +464,7 @@ class PolyTensor(torch.Tensor):
             return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
 
         if func in (aten.sum_to_size.default, aten._grad_sum_to_size.default):
-            return wrap(func(c, *args[1:], **kwargs).clone() for c in lift(args[0]))
+            return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
 
         if func is aten.nll_loss_forward.default:
             outs = [func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0])]
@@ -518,6 +508,38 @@ class PolyTensor(torch.Tensor):
 
             return wrap(out)
 
+        if func is aten._softmax_backward_data.default:
+            grad_output, output, dim = args[:3]
+            input_dtype = args[3] if len(args) > 3 else kwargs.get("input_dtype")
+            G = lift(grad_output)
+            O = lift(output)
+            GO = conv(G, O)
+            S = [go.sum(dim=dim, keepdim=True) for go in GO]
+            out = conv(O, [G[k] - S[k] for k in range(D + 1)])
+            return wrap(y.to(dtype=input_dtype) if input_dtype is not None else y for y in out)
+
+        if func is aten.sigmoid_backward.default:
+            G = lift(args[0])
+            O = lift(args[1])
+            one_minus_o = [1 - O[0]] + [-O[k] for k in range(1, D + 1)]
+            return wrap(conv(G, conv(O, one_minus_o)))
+
+        if func is aten.tanh_backward.default:
+            G = lift(args[0])
+            O = lift(args[1])
+            O2 = conv(O, O)
+            one_minus_o2 = [1 - O2[0]] + [-O2[k] for k in range(1, D + 1)]
+            return wrap(conv(G, one_minus_o2))
+
+        if func is aten.silu_backward.default:
+            G = lift(args[0])
+            X = lift(args[1])
+            S = poly_sigmoid(X)
+            one_minus_s = [1 - S[0]] + [-S[k] for k in range(1, D + 1)]
+            x_s_one_minus_s = conv(X, conv(S, one_minus_s))
+            derivative = [S[k] + x_s_one_minus_s[k] for k in range(D + 1)]
+            return wrap(conv(G, derivative))
+
         if func is aten.gelu_backward.default:
             grad_output, x = args[:2]
             approximate = args[2] if len(args) > 2 else kwargs.get("approximate", "none")
@@ -530,6 +552,18 @@ class PolyTensor(torch.Tensor):
             return out
 
         if func is aten.avg_pool2d_backward.default:
+            grad_output = args[0]
+            return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+
+        if func is aten.embedding_dense_backward.default:
+            grad_output = args[0]
+            return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+
+        if func is aten.slice_backward.default:
+            grad_output = args[0]
+            return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+
+        if func is aten.select_backward.default:
             grad_output = args[0]
             return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
 
@@ -646,6 +680,8 @@ class PolyTensor(torch.Tensor):
             aten._unsafe_view.default,
             aten.flatten.using_ints,
             aten.as_strided.default,
+            aten.slice.Tensor,
+            aten.select.int,
         ):
             return wrap(func(c, *args[1:], **kwargs).clone() for c in lift(args[0]))
 
@@ -654,251 +690,3 @@ class PolyTensor(torch.Tensor):
             return wrap(c.expand(size).clone() for c in lift(x))
 
         raise NotImplementedError(f"PolyTensor does not implement {func}")
-
-
-def _lift_coeffs_for_degree(x, degree, like):
-    if isinstance(x, PolyTensor):
-        return x.coeffs
-    if isinstance(x, torch.Tensor):
-        return (x,) + tuple(torch.zeros_like(x) for _ in range(degree))
-    return (x,) + tuple(torch.zeros_like(like) for _ in range(degree))
-
-
-def _sum_terms(xs):
-    s = xs[0]
-    for x in xs[1:]:
-        s = s + x
-    return s
-
-
-def _coeff_conv(A, B):
-    degree = len(A) - 1
-    out = []
-    for k in range(degree + 1):
-        out.append(_sum_terms([A[i] * B[k - i] for i in range(k + 1)]))
-    return out
-
-
-def _coeff_exp(X):
-    degree = len(X) - 1
-    Y = [None] * (degree + 1)
-    Y[0] = torch.exp(X[0])
-    for k in range(1, degree + 1):
-        Y[k] = _sum_terms([i * X[i] * Y[k - i] for i in range(1, k + 1)]) / k
-    return Y
-
-
-def _coeff_tanh(X):
-    degree = len(X) - 1
-    Y = [None] * (degree + 1)
-    Q = [None] * (degree + 1)
-    Y[0] = torch.tanh(X[0])
-    Q[0] = 1 - Y[0] * Y[0]
-    for k in range(1, degree + 1):
-        Y[k] = _sum_terms([i * X[i] * Q[k - i] for i in range(1, k + 1)]) / k
-        y2 = _sum_terms([Y[i] * Y[k - i] for i in range(k + 1)])
-        Q[k] = -y2
-    return Y, Q
-
-
-def _coeff_normal_cdf_and_pdf(X):
-    degree = len(X) - 1
-    X2 = _coeff_conv(X, X)
-    phi = [x / math.sqrt(2 * math.pi) for x in _coeff_exp([-0.5 * x for x in X2])]
-    cdf = [None] * (degree + 1)
-    cdf[0] = 0.5 * (1 + torch.erf(X[0] / math.sqrt(2)))
-    for k in range(1, degree + 1):
-        cdf[k] = _sum_terms([i * X[i] * phi[k - i] for i in range(1, k + 1)]) / k
-    return cdf, phi
-
-
-def _coeff_gelu(X, approximate):
-    degree = len(X) - 1
-    if approximate == "none":
-        cdf, _ = _coeff_normal_cdf_and_pdf(X)
-        return _coeff_conv(X, cdf)
-    if approximate == "tanh":
-        one = [torch.ones_like(X[0])] + [torch.zeros_like(X[0]) for _ in range(degree)]
-        X2 = _coeff_conv(X, X)
-        X3 = _coeff_conv(X2, X)
-        scale = math.sqrt(2 / math.pi)
-        U = [scale * (X[k] + 0.044715 * X3[k]) for k in range(degree + 1)]
-        T, _ = _coeff_tanh(U)
-        return [0.5 * y for y in _coeff_conv(X, [one[k] + T[k] for k in range(degree + 1)])]
-    raise NotImplementedError(f"PolyTensor does not implement GELU approximate={approximate!r}")
-
-
-def _coeff_gelu_grad(X, approximate):
-    degree = len(X) - 1
-    if approximate == "none":
-        cdf, phi = _coeff_normal_cdf_and_pdf(X)
-        x_phi = _coeff_conv(X, phi)
-        return [cdf[k] + x_phi[k] for k in range(degree + 1)]
-    if approximate == "tanh":
-        one = [torch.ones_like(X[0])] + [torch.zeros_like(X[0]) for _ in range(degree)]
-        X2 = _coeff_conv(X, X)
-        X3 = _coeff_conv(X2, X)
-        scale = math.sqrt(2 / math.pi)
-        U = [scale * (X[k] + 0.044715 * X3[k]) for k in range(degree + 1)]
-        T, Q = _coeff_tanh(U)
-        Udx = [scale * (one[k] + 3 * 0.044715 * X2[k]) for k in range(degree + 1)]
-        x_qudx = _coeff_conv(X, _coeff_conv(Q, Udx))
-        return [0.5 * (one[k] + T[k] + x_qudx[k]) for k in range(degree + 1)]
-    raise NotImplementedError(f"PolyTensor does not implement GELU approximate={approximate!r}")
-
-
-class _PolyGelu(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, approximate):
-        if not isinstance(x, PolyTensor):
-            ctx.approximate = None
-            return torch.nn.functional.gelu(x, approximate=approximate)
-
-        ctx.approximate = approximate
-        ctx.degree = x.degree
-        ctx.save_for_backward(*x.coeffs)
-        return PolyTensor(tuple(_coeff_gelu(x.coeffs, approximate)))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        if ctx.approximate is None:
-            raise RuntimeError("_PolyGelu backward expected a PolyTensor input")
-
-        X = ctx.saved_tensors
-        G = _lift_coeffs_for_degree(
-            grad_output,
-            ctx.degree,
-            grad_output.value if isinstance(grad_output, PolyTensor) else grad_output,
-        )
-        return PolyTensor(tuple(_coeff_conv(G, _coeff_gelu_grad(X, ctx.approximate)))), None
-
-
-def _poly_gelu(x, approximate="none"):
-    return _PolyGelu.apply(x, approximate)
-
-
-class _PolyLinear(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias=None):
-        x_is_poly = isinstance(x, PolyTensor)
-        weight_is_poly = isinstance(weight, PolyTensor)
-        bias_is_poly = isinstance(bias, PolyTensor)
-        polys = [p for p in (x, weight, bias) if isinstance(p, PolyTensor)]
-        degree = polys[0].degree
-        like = polys[0].value
-
-        X = _lift_coeffs_for_degree(x, degree, like)
-        W = _lift_coeffs_for_degree(weight, degree, like)
-        B = None if bias is None else _lift_coeffs_for_degree(bias, degree, like)
-
-        ctx.x_is_poly = x_is_poly
-        ctx.weight_is_poly = weight_is_poly
-        ctx.bias_is_poly = bias_is_poly
-        ctx.has_bias = bias is not None
-        ctx.degree = degree
-        ctx.save_for_backward(*(X + W + (() if B is None else B)))
-
-        out = []
-        for k in range(degree + 1):
-            y = _sum_terms([X[i].mm(W[k - i].transpose(-2, -1)) for i in range(k + 1)])
-            if B is not None:
-                y = y + B[k]
-            out.append(y)
-        return PolyTensor(tuple(out))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        degree = ctx.degree
-        saved = ctx.saved_tensors
-        X = saved[: degree + 1]
-        W = saved[degree + 1 : 2 * (degree + 1)]
-        G = _lift_coeffs_for_degree(
-            grad_output,
-            degree,
-            grad_output.value if isinstance(grad_output, PolyTensor) else grad_output,
-        )
-
-        grad_x = []
-        grad_weight = []
-        grad_bias = []
-        for k in range(degree + 1):
-            grad_x.append(_sum_terms([G[i].mm(W[k - i]) for i in range(k + 1)]))
-            grad_weight.append(_sum_terms([G[i].transpose(-2, -1).mm(X[k - i]) for i in range(k + 1)]))
-            grad_bias.append(G[k].sum(dim=tuple(range(G[k].dim() - 1))))
-
-        if ctx.x_is_poly:
-            grad_x = PolyTensor(tuple(grad_x))
-        else:
-            grad_x = grad_x[0]
-
-        if ctx.weight_is_poly:
-            grad_weight = PolyTensor(tuple(grad_weight))
-        else:
-            grad_weight = grad_weight[0]
-
-        if ctx.has_bias:
-            if ctx.bias_is_poly:
-                grad_bias = PolyTensor(tuple(grad_bias))
-            else:
-                grad_bias = grad_bias[0]
-        else:
-            grad_bias = None
-
-        return grad_x, grad_weight, grad_bias
-
-
-def _poly_linear(x, weight, bias=None):
-    if not any(isinstance(p, PolyTensor) for p in (x, weight, bias)):
-        return F.linear(x, weight, bias)
-    return _PolyLinear.apply(x, weight, bias)
-
-
-class _PolyMm(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, a, b):
-        a_is_poly = isinstance(a, PolyTensor)
-        b_is_poly = isinstance(b, PolyTensor)
-        degree = a.degree if a_is_poly else b.degree
-        like = a.value if a_is_poly else b.value
-        A = _lift_coeffs_for_degree(a, degree, like)
-        B = _lift_coeffs_for_degree(b, degree, like)
-
-        ctx.a_is_poly = a_is_poly
-        ctx.b_is_poly = b_is_poly
-        ctx.degree = degree
-        ctx.save_for_backward(*(A + B))
-
-        out = []
-        for k in range(degree + 1):
-            out.append(_sum_terms([A[i].mm(B[k - i]) for i in range(k + 1)]))
-        return PolyTensor(tuple(out))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        degree = ctx.degree
-        saved = ctx.saved_tensors
-        A = saved[: degree + 1]
-        B = saved[degree + 1 :]
-        G = _lift_coeffs_for_degree(grad_output, degree, grad_output.value if isinstance(grad_output, PolyTensor) else grad_output)
-
-        grad_a = []
-        grad_b = []
-        for k in range(degree + 1):
-            grad_a.append(_sum_terms([G[i].mm(B[k - i].transpose(-2, -1)) for i in range(k + 1)]))
-            grad_b.append(_sum_terms([A[i].transpose(-2, -1).mm(G[k - i]) for i in range(k + 1)]))
-
-        if ctx.a_is_poly:
-            grad_a = PolyTensor(tuple(grad_a))
-        else:
-            grad_a = grad_a[0]
-
-        if ctx.b_is_poly:
-            grad_b = PolyTensor(tuple(grad_b))
-        else:
-            grad_b = grad_b[0]
-
-        return grad_a, grad_b
-
-
-def _poly_mm(a, b):
-    return _PolyMm.apply(a, b)
