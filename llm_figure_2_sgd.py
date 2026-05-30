@@ -96,9 +96,20 @@ def freeze_except(module, trainable_module_name):
     return trainable_module
 
 
-def freeze_non_poly_parameters(module):
-    for param in module.parameters():
-        param.requires_grad_(isinstance(param, PolyTensor))
+def assert_only_poly_parameters_trainable(module):
+    bad_params = [
+        (name, type(param).__name__)
+        for name, param in module.named_parameters()
+        if param.requires_grad and not isinstance(param, PolyTensor)
+    ]
+    if bad_params:
+        preview = ", ".join(f"{name} ({type_name})" for name, type_name in bad_params[:10])
+        if len(bad_params) > 10:
+            preview += f", ... and {len(bad_params) - 10} more"
+        raise RuntimeError(
+            "expected polynomial training to leave only PolyTensor parameters trainable; "
+            f"found trainable non-PolyTensor parameters: {preview}"
+        )
 
 
 def dtype_from_name(name):
@@ -331,7 +342,7 @@ def make_model(args, device, degree=None):
     trainable_module = freeze_except(model, args.trainable_module)
     if degree is not None:
         make_poly_parameters(trainable_module, degree)
-        freeze_non_poly_parameters(model)
+        assert_only_poly_parameters_trainable(model)
 
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if num_trainable == 0:

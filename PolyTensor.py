@@ -223,6 +223,9 @@ class PolyTensor(torch.Tensor):
 
             return Y
 
+        def poly_rsqrt(X):
+            return poly_reciprocal(poly_sqrt(X))
+
         def poly_log_softmax(X, dim):
             M = X[0].max(dim=dim, keepdim=True).values
             Z = [X[0] - M] + list(X[1:])
@@ -239,13 +242,27 @@ class PolyTensor(torch.Tensor):
             S = [e.sum(dim=dim, keepdim=True) for e in E]
             return conv(E, poly_reciprocal(S))
 
+        def poly_logsumexp(X, dim, keepdim=False):
+            if isinstance(dim, (tuple, list)):
+                if len(dim) != 1:
+                    raise NotImplementedError("PolyTensor logsumexp supports one dimension")
+                dim = dim[0]
+            M = X[0].max(dim=dim, keepdim=True).values
+            Z = [X[0] - M] + list(X[1:])
+            E = poly_exp(Z)
+            S = [e.sum(dim=dim, keepdim=True) for e in E]
+            L = poly_log(S)
+            L[0] = L[0] + M
+            if not keepdim:
+                L = [l.squeeze(dim) for l in L]
+            return L
+
         def poly_one(like):
             return [torch.ones_like(like)] + [torch.zeros_like(like) for _ in range(D)]
 
         def poly_sigmoid(X):
-            E = poly_exp([-x for x in X])
-            denominator = [1 + E[0]] + E[1:]
-            return poly_reciprocal(denominator)
+            T, _ = poly_tanh([0.5 * x for x in X])
+            return [0.5 * (1 + T[0])] + [0.5 * t for t in T[1:]]
 
         def poly_tanh(X):
             Y = [None] * (D + 1)
@@ -361,6 +378,9 @@ class PolyTensor(torch.Tensor):
                 return wrap(c / b for c in a.coeffs)
             return wrap(conv(lift(a), poly_reciprocal(lift(b))))
 
+        if func is aten.reciprocal.default:
+            return wrap(poly_reciprocal(lift(args[0])))
+
         if func is aten.mm.default:
             return wrap(bilinear(torch.mm, args[0], args[1]))
 
@@ -369,6 +389,62 @@ class PolyTensor(torch.Tensor):
 
         if func is aten.bmm.default:
             return correct(wrap(bilinear(torch.bmm, args[0], args[1])))
+
+        if func is aten.scaled_dot_product_attention.default:
+            query, key, value = args[:3]
+            attn_mask = args[3] if len(args) > 3 else kwargs.get("attn_mask")
+            dropout_p = args[4] if len(args) > 4 else kwargs.get("dropout_p", 0.0)
+            is_causal = args[5] if len(args) > 5 else kwargs.get("is_causal", False)
+            scale = kwargs.get("scale")
+            enable_gqa = kwargs.get("enable_gqa", False)
+            if enable_gqa:
+                raise NotImplementedError("PolyTensor does not implement GQA head repetition")
+
+            scale = (1.0 / math.sqrt(query.size(-1))) if scale is None else scale
+            scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+            if is_causal:
+                causal_mask = torch.ones(
+                    scores.shape[-2:],
+                    dtype=torch.bool,
+                    device=scores.device,
+                ).tril()
+                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    scores = scores.masked_fill(~attn_mask, float("-inf"))
+                else:
+                    scores = scores + attn_mask
+            attn_weight = torch.softmax(scores, dim=-1)
+            if dropout_p != 0.0:
+                attn_weight = torch.dropout(attn_weight, dropout_p, True)
+            return torch.matmul(attn_weight, value)
+
+        if func is aten._scaled_dot_product_flash_attention_for_cpu.default:
+            query, key, value = args[:3]
+            dropout_p = args[3] if len(args) > 3 else kwargs.get("dropout_p", 0.0)
+            is_causal = args[4] if len(args) > 4 else kwargs.get("is_causal", False)
+            attn_mask = kwargs.get("attn_mask")
+            scale = kwargs.get("scale")
+
+            scale = (1.0 / math.sqrt(query.size(-1))) if scale is None else scale
+            scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+            if is_causal:
+                causal_mask = torch.ones(
+                    scores.shape[-2:],
+                    dtype=torch.bool,
+                    device=scores.device,
+                ).tril()
+                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    scores = scores.masked_fill(~attn_mask, float("-inf"))
+                else:
+                    scores = scores + attn_mask
+            logsumexp = torch.logsumexp(scores, dim=-1)
+            attn_weight = torch.softmax(scores, dim=-1)
+            if dropout_p != 0.0:
+                attn_weight = torch.dropout(attn_weight, dropout_p, True)
+            return torch.matmul(attn_weight, value), logsumexp
 
         if func is aten.addmm.default:
             x, a, b = args[:3]
@@ -450,6 +526,57 @@ class PolyTensor(torch.Tensor):
                 dst.copy_(src)
             return a
 
+        if func in (aten.div_.Tensor, aten.div_.Scalar):
+            a, b = args[:2]
+            rounding_mode = kwargs.get("rounding_mode")
+            if rounding_mode is not None:
+                raise NotImplementedError("PolyTensor does not implement rounded in-place division")
+            if not is_poly(b):
+                for coeff in a.coeffs:
+                    coeff.div_(b)
+                return a
+            out = conv(lift(a), poly_reciprocal(lift(b)))
+            for dst, src in zip(a.coeffs, out):
+                dst.copy_(src)
+            return a
+
+        if func in (aten.masked_fill.Scalar, aten.masked_fill.Tensor):
+            x, mask, value = args[:3]
+            X = lift(x)
+            if is_poly(value):
+                V = lift(value)
+                return wrap(torch.where(plain(mask), V[k], X[k]) for k in range(D + 1))
+            return wrap(
+                (
+                    X[0].masked_fill(plain(mask), value),
+                    *(c.masked_fill(plain(mask), 0) for c in X[1:]),
+                )
+            )
+
+        if func in (aten.masked_fill_.Scalar, aten.masked_fill_.Tensor):
+            x, mask, value = args[:3]
+            if is_poly(value):
+                X, V = lift(x), lift(value)
+                for k in range(D + 1):
+                    X[k].copy_(torch.where(plain(mask), V[k], X[k]))
+                return x
+            x.coeffs[0].masked_fill_(plain(mask), value)
+            for coeff in x.coeffs[1:]:
+                coeff.masked_fill_(plain(mask), 0)
+            return x
+
+        if func in (
+            aten.where.self,
+            aten.where.ScalarOther,
+            aten.where.ScalarSelf,
+            aten.where.Scalar,
+        ):
+            condition = plain(args[0])
+            a = args[1]
+            b = args[2]
+            A, B = lift(a), lift(b)
+            return wrap(torch.where(condition, A[k], B[k]) for k in range(D + 1))
+
         if func is aten.exp.default:
             return wrap(poly_exp(lift(args[0])))
 
@@ -458,6 +585,15 @@ class PolyTensor(torch.Tensor):
 
         if func is aten.sqrt.default:
             return wrap(poly_sqrt(lift(args[0])))
+
+        if func is aten.rsqrt.default:
+            return wrap(poly_rsqrt(lift(args[0])))
+
+        if func is aten.logsumexp.default:
+            x = args[0]
+            dim = args[1] if len(args) > 1 else kwargs["dim"]
+            keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+            return wrap(poly_logsumexp(lift(x), dim, keepdim))
 
         if func is aten.sigmoid.default:
             return wrap(poly_sigmoid(lift(args[0])))
@@ -477,6 +613,14 @@ class PolyTensor(torch.Tensor):
             dim = args[1] if len(args) > 1 else kwargs["dim"]
             return wrap(poly_log_softmax(lift(args[0]), dim))
 
+        if func is aten.log_softmax.int:
+            dim = args[1] if len(args) > 1 else kwargs["dim"]
+            dtype = args[2] if len(args) > 2 else kwargs.get("dtype")
+            out = poly_log_softmax(lift(args[0]), dim)
+            if dtype is not None:
+                out = [o.to(dtype=dtype) for o in out]
+            return wrap(out)
+
         if func is aten._softmax.default:
             dim = args[1] if len(args) > 1 else kwargs["dim"]
             half_to_float = args[2] if len(args) > 2 else kwargs.get("half_to_float", False)
@@ -484,11 +628,22 @@ class PolyTensor(torch.Tensor):
                 raise NotImplementedError("PolyTensor does not implement half_to_float softmax")
             return wrap(poly_softmax(lift(args[0]), dim))
 
+        if func is aten.softmax.int:
+            dim = args[1] if len(args) > 1 else kwargs["dim"]
+            dtype = args[2] if len(args) > 2 else kwargs.get("dtype")
+            out = poly_softmax(lift(args[0]), dim)
+            if dtype is not None:
+                out = [o.to(dtype=dtype) for o in out]
+            return wrap(out)
+
         if func is aten.embedding.default:
             weight = args[0]
             return wrap(func(w, *plain(args[1:]), **plain(kwargs)) for w in lift(weight))
 
         if func is aten.avg_pool2d.default:
+            return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
+
+        if func in (aten.mean.default, aten.mean.dim):
             return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
 
         if func in (aten.sum.default, aten.sum.dim_IntList):
@@ -581,6 +736,38 @@ class PolyTensor(torch.Tensor):
             for c in lift(args[0])[1:]:
                 out = out | torch.isnan(c)
             return out
+
+        if func is aten.native_dropout.default:
+            x = args[0]
+            p = args[1] if len(args) > 1 else kwargs["p"]
+            train = args[2] if len(args) > 2 else kwargs["train"]
+            X = lift(x)
+            y0, mask = func(X[0], p, train)
+            if not train or p == 0:
+                return wrap((y0, *X[1:])), mask
+            if p == 1:
+                return wrap(torch.zeros_like(c) for c in X), mask
+            scale = 1.0 / (1.0 - p)
+            mask_values = mask.to(dtype=X[0].dtype)
+            return wrap((y0, *(c * mask_values * scale for c in X[1:]))), mask
+
+        if func is aten.dropout.default:
+            x = args[0]
+            p = args[1] if len(args) > 1 else kwargs["p"]
+            train = args[2] if len(args) > 2 else kwargs["train"]
+            X = lift(x)
+            y, mask = aten.native_dropout.default(X[0], p, train)
+            if not train or p == 0:
+                return wrap((y, *X[1:]))
+            if p == 1:
+                return wrap(torch.zeros_like(c) for c in X)
+            mask = mask.to(dtype=X[0].dtype)
+            scale = 1.0 / (1.0 - p)
+            return wrap((y, *(c * mask * scale for c in X[1:])))
+
+        if func is aten.native_dropout_backward.default:
+            grad_output = args[0]
+            return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
 
         if func is aten.avg_pool2d_backward.default:
             grad_output = args[0]
@@ -677,6 +864,20 @@ class PolyTensor(torch.Tensor):
             x0 = lift(args[0])[0]
             return PolyTensor((torch.ones_like(x0),) + tuple(torch.zeros_like(x0) for _ in range(D)))
 
+        if func is aten.zeros_like.default:
+            return wrap(torch.zeros_like(c, *args[1:], **kwargs) for c in lift(args[0]))
+
+        if func is aten.empty_like.default:
+            return wrap(torch.empty_like(c, *args[1:], **kwargs) for c in lift(args[0]))
+
+        if func is aten.full_like.default:
+            call_kwargs = dict(kwargs)
+            fill_value = args[1] if len(args) > 1 else call_kwargs.pop("fill_value")
+            return wrap(
+                torch.full_like(c, fill_value, *args[2:], **call_kwargs)
+                for c in lift(args[0])
+            )
+
         if func is aten.new_empty_strided.default:
             return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
 
@@ -688,13 +889,32 @@ class PolyTensor(torch.Tensor):
             x._set_coeffs(c.detach() for c in lift(x))
             return x
 
+        if func is aten.alias.default:
+            return correct(PolyTensor(tuple(func(c) for c in lift(args[0]))))
+
         if func is aten.clone.default:
             x = args[0]
             return PolyTensor(tuple(c.clone(**kwargs) for c in lift(x)), requires_grad=x.requires_grad)
 
+        if func in (
+            aten._to_copy.default,
+            aten.to.dtype,
+            aten.to.device,
+            aten.to.other,
+            aten.to.dtype_layout,
+        ):
+            return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
+
         if func is aten.zero_.default:
             x = args[0]
             for coeff in lift(x):
+                coeff.zero_()
+            return x
+
+        if func in (aten.bernoulli_.float, aten.bernoulli_.Tensor):
+            x = args[0]
+            x.coeffs[0].bernoulli_(*plain(args[1:]), **plain(kwargs))
+            for coeff in x.coeffs[1:]:
                 coeff.zero_()
             return x
 
@@ -707,6 +927,7 @@ class PolyTensor(torch.Tensor):
         if func in (
             aten.t.default,
             aten.transpose.int,
+            aten.permute.default,
             aten.view.default,
             aten.reshape.default,
             aten._unsafe_view.default,
@@ -723,5 +944,30 @@ class PolyTensor(torch.Tensor):
         if func is aten.expand.default:
             x, size = args[:2]
             return wrap(c.expand(size).clone() for c in lift(x))
+
+        if func is aten.cat.default:
+            tensors = args[0]
+            dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
+            return wrap(
+                torch.cat([lift(tensor)[k] for tensor in tensors], dim=dim)
+                for k in range(D + 1)
+            )
+
+        if func is aten.stack.default:
+            tensors = args[0]
+            dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
+            return wrap(
+                torch.stack([lift(tensor)[k] for tensor in tensors], dim=dim)
+                for k in range(D + 1)
+            )
+
+        if func is aten.index_select.default:
+            return wrap(func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0]))
+
+        if func is aten.gather.default:
+            return wrap(func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0]))
+
+        if func is aten.index.Tensor:
+            return wrap(func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0]))
 
         raise NotImplementedError(f"PolyTensor does not implement {func}")

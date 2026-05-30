@@ -35,7 +35,7 @@ EPOCHS = 1
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 BETAS = (0.9, 0.95)
-EPS = 1e-8
+EPS = 1e-3 # 1e-8
 GRADIENT_ACCUMULATION_STEPS = 16
 WARMUP_RATIO = 0.03
 DOWNWEIGHT_FRACTION = 0.10
@@ -47,7 +47,7 @@ LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
 LORA_TARGET_MODULES = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
-DTYPE = "bfloat16"
+DTYPE = "float32"
 GRADIENT_CHECKPOINTING = True
 SEED = 0
 
@@ -60,6 +60,12 @@ def make_generator(seed):
     generator = torch.Generator()
     generator.manual_seed(seed)
     return generator
+
+
+def reset_training_rng(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def make_poly_parameters(module, degree):
@@ -80,9 +86,20 @@ def split_csv(values):
     return [value.strip() for value in values.split(",") if value.strip()]
 
 
-def freeze_non_poly_parameters(module):
-    for param in module.parameters():
-        param.requires_grad_(isinstance(param, PolyTensor))
+def assert_only_poly_parameters_trainable(module):
+    bad_params = [
+        (name, type(param).__name__)
+        for name, param in module.named_parameters()
+        if param.requires_grad and not isinstance(param, PolyTensor)
+    ]
+    if bad_params:
+        preview = ", ".join(f"{name} ({type_name})" for name, type_name in bad_params[:10])
+        if len(bad_params) > 10:
+            preview += f", ... and {len(bad_params) - 10} more"
+        raise RuntimeError(
+            "expected polynomial training to leave only PolyTensor parameters trainable; "
+            f"found trainable non-PolyTensor parameters: {preview}"
+        )
 
 
 def dtype_from_name(name):
@@ -354,7 +371,7 @@ def make_model(args, device, degree=None):
 
     if degree is not None:
         make_poly_parameters(model, degree)
-        freeze_non_poly_parameters(model)
+        assert_only_poly_parameters_trainable(model)
 
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if num_trainable == 0:
@@ -526,6 +543,7 @@ def train_one_epoch(
 
 
 def train_model(model, train_data, selected, downweight, epoch_indices, collator, args, device):
+    reset_training_rng(args.seed + 60)
     loss_fn = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
     optimizer = make_optimizer(model, args)
     batches_per_epoch = (len(train_data) + args.batch_size - 1) // args.batch_size
@@ -716,7 +734,7 @@ def parse_args():
         choices=("auto", "float32", "bfloat16", "float16"),
         default=DTYPE,
     )
-    parser.add_argument("--attn-implementation", default="sdpa")
+    parser.add_argument("--attn-implementation", default="eager")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--quiet", action="store_true")
