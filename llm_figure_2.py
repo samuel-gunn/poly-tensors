@@ -35,7 +35,7 @@ DTYPE = "float32"
 
 ### Length of training
 EPOCHS = 1
-MAX_TRAIN_EXAMPLES = 25000#200
+MAX_TRAIN_EXAMPLES = 10000#200
 
 ### Basic training hyperparameters
 BATCH_SIZE = 4#1 # The batch sized used in the computation

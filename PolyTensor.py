@@ -274,6 +274,53 @@ class PolyTensor(torch.Tensor):
                 L = [l.squeeze(dim) for l in L]
             return L
 
+        def poly_cross_entropy_loss(X, target, weight, reduction, ignore_index):
+            if isinstance(reduction, str):
+                reduction = {"none": 0, "mean": 1, "sum": 2}[reduction]
+            if target.shape == X[0].shape:
+                raise NotImplementedError("PolyTensor cross entropy does not implement soft labels")
+            if X[0].dim() < 2:
+                raise NotImplementedError("PolyTensor cross entropy expects a class dimension")
+
+            target = plain(target)
+            weight = plain(weight)
+            valid = target != ignore_index
+            safe_target = torch.where(valid, target, torch.zeros_like(target))
+            gather_index = safe_target.unsqueeze(1)
+
+            log_normalizer = poly_logsumexp(X, 1)
+            target_logits = [
+                x.gather(1, gather_index).squeeze(1)
+                for x in X
+            ]
+            losses = [
+                torch.where(
+                    valid,
+                    log_normalizer[k] - target_logits[k],
+                    torch.zeros_like(log_normalizer[k]),
+                )
+                for k in range(D + 1)
+            ]
+
+            if weight is not None:
+                sample_weight = weight.gather(
+                    0,
+                    safe_target.reshape(-1),
+                ).reshape_as(safe_target)
+                sample_weight = torch.where(valid, sample_weight, torch.zeros_like(sample_weight))
+                losses = [loss * sample_weight for loss in losses]
+                total_weight = sample_weight.sum()
+            else:
+                total_weight = valid.sum().to(device=losses[0].device, dtype=losses[0].dtype)
+
+            if reduction == 0:
+                return losses
+            if reduction == 1:
+                return [loss.sum() / total_weight for loss in losses]
+            if reduction == 2:
+                return [loss.sum() for loss in losses]
+            raise ValueError(f"unknown reduction {reduction!r}")
+
         def poly_one(like):
             return [torch.ones_like(like)] + [torch.zeros_like(like) for _ in range(D)]
 
@@ -682,11 +729,7 @@ class PolyTensor(torch.Tensor):
             if label_smoothing != 0.0:
                 raise NotImplementedError("PolyTensor does not implement label-smoothed cross entropy")
 
-            L = poly_log_softmax(lift(x), 1)
-            return wrap(
-                aten.nll_loss_forward.default(c, plain(target), plain(weight), reduction, ignore_index)[0]
-                for c in L
-            )
+            return wrap(poly_cross_entropy_loss(lift(x), target, weight, reduction, ignore_index))
 
         if func is aten.nll_loss_backward.default:
             grad_output = args[0]
