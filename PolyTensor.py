@@ -110,11 +110,15 @@ class PolyTensor(torch.Tensor):
                 return (x,) + tuple(torch.zeros_like(x) for _ in range(D))
             return (x,) + tuple(torch.zeros_like(like) for _ in range(D))
 
-        def wrap(cs):
-            return PolyTensor(
-                tuple(c.clone() if isinstance(c, torch.Tensor) else c for c in cs),
-                requires_grad=False,
-            )
+        def clone_coeffs(cs):
+            return tuple(c.clone() if isinstance(c, torch.Tensor) else c for c in cs)
+
+        def wrap(cs, *, clone=False):
+            if clone:
+                cs = clone_coeffs(cs)
+            else:
+                cs = tuple(cs)
+            return PolyTensor(cs, requires_grad=False)
 
         def correct(out):
             return return_and_correct_aliasing(func, args, kwargs, out)
@@ -166,7 +170,20 @@ class PolyTensor(torch.Tensor):
             return s
 
         def bilinear(op, a, b):
+            a_is_poly = is_poly(a)
+            b_is_poly = is_poly(b)
+            if a_is_poly and not b_is_poly:
+                A = a.coeffs
+                return [op(A[k], b) for k in range(D + 1)]
+            if b_is_poly and not a_is_poly:
+                B = b.coeffs
+                return [op(a, B[k]) for k in range(D + 1)]
+            if not a_is_poly and not b_is_poly:
+                y0 = op(a, b)
+                return [y0] + [torch.zeros_like(y0) for _ in range(D)]
+
             A, B = lift(a), lift(b)
+
             out = []
             for k in range(D + 1):
                 s = op(A[0], B[k])
@@ -338,10 +355,10 @@ class PolyTensor(torch.Tensor):
             a, b = args[:2]
             alpha = kwargs.get("alpha", 1)
             if is_poly(a) and not is_poly(b):
-                return wrap((a.coeffs[0] + alpha * b, *a.coeffs[1:]))
+                return wrap((a.coeffs[0] + alpha * b, *clone_coeffs(a.coeffs[1:])))
             if not is_poly(a) and is_poly(b):
                 if alpha == 1:
-                    return wrap((a + b.coeffs[0], *b.coeffs[1:]))
+                    return wrap((a + b.coeffs[0], *clone_coeffs(b.coeffs[1:])))
                 return wrap((a + alpha * b.coeffs[0], *(alpha * c for c in b.coeffs[1:])))
             A, B = lift(a), lift(b)
             return wrap(A[k] + alpha * B[k] for k in range(D + 1))
@@ -350,7 +367,7 @@ class PolyTensor(torch.Tensor):
             a, b = args[:2]
             alpha = kwargs.get("alpha", 1)
             if is_poly(a) and not is_poly(b):
-                return wrap((a.coeffs[0] - alpha * b, *a.coeffs[1:]))
+                return wrap((a.coeffs[0] - alpha * b, *clone_coeffs(a.coeffs[1:])))
             if not is_poly(a) and is_poly(b):
                 return wrap((a - alpha * b.coeffs[0], *(-alpha * c for c in b.coeffs[1:])))
             A, B = lift(a), lift(b)
@@ -457,7 +474,7 @@ class PolyTensor(torch.Tensor):
         if func is aten.linear.default:
             x, weight = args[:2]
             bias = args[2] if len(args) > 2 else kwargs.get("bias")
-            Y = bilinear(lambda a, b: torch.matmul(a, b.transpose(-2, -1).clone()), x, weight)
+            Y = bilinear(lambda a, b: torch.matmul(a, b.transpose(-2, -1)), x, weight)
             if bias is not None:
                 B = lift(bias)
                 Y = [Y[k] + B[k] for k in range(D + 1)]
@@ -744,7 +761,7 @@ class PolyTensor(torch.Tensor):
             X = lift(x)
             y0, mask = func(X[0], p, train)
             if not train or p == 0:
-                return wrap((y0, *X[1:])), mask
+                return wrap((y0, *X[1:]), clone=True), mask
             if p == 1:
                 return wrap(torch.zeros_like(c) for c in X), mask
             scale = 1.0 / (1.0 - p)
@@ -758,7 +775,7 @@ class PolyTensor(torch.Tensor):
             X = lift(x)
             y, mask = aten.native_dropout.default(X[0], p, train)
             if not train or p == 0:
-                return wrap((y, *X[1:]))
+                return wrap((y, *X[1:]), clone=True)
             if p == 1:
                 return wrap(torch.zeros_like(c) for c in X)
             mask = mask.to(dtype=X[0].dtype)
@@ -939,11 +956,11 @@ class PolyTensor(torch.Tensor):
             aten.squeeze.dim,
             aten.squeeze.default,
         ):
-            return wrap(func(c, *args[1:], **kwargs).clone() for c in lift(args[0]))
+            return correct(wrap(func(c, *args[1:], **kwargs) for c in lift(args[0])))
 
         if func is aten.expand.default:
             x, size = args[:2]
-            return wrap(c.expand(size).clone() for c in lift(x))
+            return correct(wrap(c.expand(size) for c in lift(x)))
 
         if func is aten.cat.default:
             tensors = args[0]

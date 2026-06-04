@@ -26,28 +26,37 @@ from PolyTensor import PolyTensor
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+OUTPUT_PATH = "results/llm_figure_2.png"
 
+### Model and data
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
 DATASET_NAME = "tatsu-lab/alpaca"
-OUTPUT_PATH = "results/llm_figure_2.png"
-BATCH_SIZE = 1
+DTYPE = "float32"
+
+### Length of training
 EPOCHS = 1
+MAX_TRAIN_EXAMPLES = 25000#200
+
+### Basic training hyperparameters
+BATCH_SIZE = 4#1 # The batch sized used in the computation
+GRADIENT_ACCUMULATION_STEPS = 4#1 # To simulate larger batches. The effective batch size is BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS, but these are done in sequence.
 LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 0.01
-BETAS = (0.9, 0.95)
-EPS = 1e-3 # 1e-8
-GRADIENT_ACCUMULATION_STEPS = 16
-WARMUP_RATIO = 0.03
-DOWNWEIGHT_FRACTION = 0.10
+EPS = 1e-3
+
+### Deletion parameters
+DOWNWEIGHT_FRACTION = 0.02
 DEGREE = 3
 NUM_DOTS = 6
-MAX_TRAIN_EXAMPLES = 1000
+
+### Training hyperparameters
+WEIGHT_DECAY = 0.01
+BETAS = (0.9, 0.95)
+WARMUP_RATIO = 0.03
 MAX_LENGTH = 256
 LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
 LORA_TARGET_MODULES = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
-DTYPE = "float32"
 GRADIENT_CHECKPOINTING = True
 SEED = 0
 
@@ -623,7 +632,7 @@ def retrained_losses(train_data, eval_data, selected, epoch_indices, collator, a
     losses = []
 
     for z in zs:
-        print(f"retraining empirical LLM fine-tune at z={z:.2f}")
+        print(f"retraining LLM fine-tune at z={z:.2f}")
         model = make_model(args, device)
         if z == 0.0:
             before_loss = eval_loss(model, eval_data, collator, device).detach().float().cpu().item()
@@ -646,25 +655,27 @@ def evaluate_polynomial(coefficients, zs, degree):
     return ys
 
 
-def plot_results(zs, empirical, coefficients, eval_index, num_downweighted, args):
+def plot_results(zs, retrained, coefficients, num_trained_examples, num_downweighted, args):
     grid = torch.linspace(0.0, 1.0, 301, dtype=torch.float64)
 
     fig, ax = plt.subplots(figsize=(7.0, 4.6))
-    ax.scatter(zs, empirical, color="black", label="empirical", zorder=3)
+    ax.scatter(zs, retrained, color="black", label="retrained", zorder=3)
 
     for degree in range(1, args.degree + 1):
         approx = evaluate_polynomial(coefficients, grid, degree)
         ax.plot(grid, approx, label=f"degree {degree}", linewidth=2)
 
     ax.set_xlabel("downweight z")
-    ax.set_ylabel("held-out token loss f(z 1_D)")
+    ax.set_ylabel("loss f(z 1_D)")
     ax.set_title("LLM fine-tuning deletion Taylor approximations")
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
     ax.text(
         0.01,
         0.99,
         (
-            f"{args.model_name}, {num_downweighted} downweighted examples, "
-            f"eval row {eval_index}, LoRA r={args.lora_r}"
+            f"n={num_trained_examples}, batch size={effective_batch_size}, "
+            f"deletions={num_downweighted}\n"
+            f"LoRA r={args.lora_r}, epochs={args.epochs}"
         ),
         transform=ax.transAxes,
         va="top",
@@ -811,7 +822,8 @@ def main():
         args,
         device,
     )
-    plot_results(zs, empirical, coefficients, eval_index, selected.sum().item(), args)
+    num_trained_examples = sum(len(indices) for indices in epoch_indices)
+    plot_results(zs, empirical, coefficients, num_trained_examples, selected.sum().item(), args)
 
 
 if __name__ == "__main__":
