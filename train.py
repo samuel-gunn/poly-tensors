@@ -1,68 +1,190 @@
 import argparse
 import gc
+import json
 import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
-if "--download" not in sys.argv[1:]:
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["HF_DATASETS_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+DEFAULT_CONFIG_PATH = "train_config.json"
+CONFIG_KEYS = (
+    "model_name",
+    "dataset_name",
+    "dataset_config",
+    "dataset_split",
+    "jsonl",
+    "text_column",
+    "cache_dir",
+    "batch_size",
+    "epochs",
+    "learning_rate",
+    "weight_decay",
+    "beta1",
+    "beta2",
+    "eps",
+    "gradient_accumulation_steps",
+    "warmup_ratio",
+    "warmup_steps",
+    "min_learning_rate_ratio",
+    "max_train_examples",
+    "num_eval_examples",
+    "max_length",
+    "seed",
+    "eval_index",
+    "num_workers",
+    "pad_to_multiple_of",
+    "dpi",
+    "lora_r",
+    "lora_alpha",
+    "lora_dropout",
+    "lora_target_modules",
+    "gradient_checkpointing",
+    "dtype",
+    "attn_implementation",
+    "trust_remote_code",
+)
 
-import matplotlib
+
+def download_enabled_from_argv(argv):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--download", action="store_true")
+    args, _ = parser.parse_known_args(argv)
+    return args.download
+
+
+def read_train_config(config_path):
+    with Path(config_path).open(encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError(f"{config_path} must contain a JSON object")
+    return config
+
+
+def validate_train_config(config, config_path):
+    expected = set(CONFIG_KEYS)
+    actual = set(config)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing:
+        raise ValueError(
+            f"{config_path} is missing required config keys: {', '.join(missing)}"
+        )
+    if extra:
+        raise ValueError(
+            f"{config_path} contains unknown config keys: {', '.join(extra)}"
+        )
+
+
+def configure_offline_from_argv(argv=None):
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    if argv is None:
+        argv = sys.argv[1:]
+    if not download_enabled_from_argv(argv):
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+configure_offline_from_argv()
+
 import torch
 from datasets import DownloadConfig, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from PolyTensor import PolyTensor
+
+def load_args_from_config(config_path, overrides=None):
+    config = read_train_config(config_path)
+    validate_train_config(config, config_path)
+    args = argparse.Namespace(**config)
+    args.train_config = config
+    args.config = config_path
+    if overrides:
+        for name, value in overrides.items():
+            setattr(args, name, value)
+    return args
 
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-OUTPUT_PATH = "results/llm_figure_2.png"
-
-### Model and data
-MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
-DATASET_NAME = "tatsu-lab/alpaca"
-DTYPE = "float32"
-
-### Length of training
-EPOCHS = 1
-MAX_TRAIN_EXAMPLES = 10000#200
-
-### Basic training hyperparameters
-BATCH_SIZE = 4#1 # The batch sized used in the computation
-GRADIENT_ACCUMULATION_STEPS = 4#1 # To simulate larger batches. The effective batch size is BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS, but these are done in sequence.
-LEARNING_RATE = 1e-4
-EPS = 1e-3
-
-### Deletion parameters
-DOWNWEIGHT_FRACTION = 0.02
-DEGREE = 3
-NUM_DOTS = 6
-
-### Training hyperparameters
-WEIGHT_DECAY = 0.01
-BETAS = (0.9, 0.95)
-WARMUP_RATIO = 0.03
-MAX_LENGTH = 256
-LORA_R = 8
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.05
-LORA_TARGET_MODULES = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
-GRADIENT_CHECKPOINTING = True
-SEED = 0
+def result_paths(expt_name):
+    if (
+        not expt_name
+        or expt_name in (".", "..")
+        or "/" in expt_name
+        or "\\" in expt_name
+    ):
+        raise ValueError("expt_name must be a non-empty filename stem")
+    results_dir = Path("results")
+    return results_dir / f"{expt_name}.png", results_dir / f"{expt_name}.json"
 
 
-def tensor_value(x):
-    return x.value if isinstance(x, PolyTensor) else x
+def validate_training_args(
+    args,
+    validate_deletion_args=False,
+    allow_zero_eval_examples=False,
+):
+    if validate_deletion_args:
+        if args.degree < 1:
+            raise ValueError("--degree must be at least 1")
+        if not 0.0 <= args.downweight_fraction <= 1.0:
+            raise ValueError("--downweight-fraction must be between 0 and 1")
+        if args.num_dots < 2:
+            raise ValueError("--num-dots must be at least 2")
+    if args.max_train_examples < 1:
+        raise ValueError("max_train_examples must be at least 1")
+    min_eval_examples = 0 if allow_zero_eval_examples else 1
+    if args.num_eval_examples < min_eval_examples:
+        raise ValueError(f"num_eval_examples must be at least {min_eval_examples}")
+    if args.batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    if args.max_length < 2:
+        raise ValueError("max_length must be at least 2")
+    if not 0.0 <= args.warmup_ratio <= 1.0:
+        raise ValueError("warmup_ratio must be between 0 and 1")
+    if not 0.0 <= args.min_learning_rate_ratio <= 1.0:
+        raise ValueError("min_learning_rate_ratio must be between 0 and 1")
+    if args.lora_r < 1:
+        raise ValueError("lora_r must be at least 1")
+    if args.lora_alpha < 1:
+        raise ValueError("lora_alpha must be at least 1")
+    if not 0.0 <= args.lora_dropout < 1.0:
+        raise ValueError("lora_dropout must be in [0, 1)")
+    if not split_csv(args.lora_target_modules):
+        raise ValueError("lora_target_modules must include at least one module name")
+    if args.dtype not in ("auto", "float32", "bfloat16", "float16"):
+        raise ValueError("dtype must be one of: auto, float32, bfloat16, float16")
+
+
+def format_run_summary(args, train_data, selected, eval_index, epoch_indices, include_downweighted=True):
+    eval_prefix = "eval rows" if isinstance(eval_index, str) else "eval row"
+    parts = [
+        f"device={torch.device('cuda' if torch.cuda.is_available() else 'cpu')}",
+        f"model={args.model_name}",
+        f"train examples={len(train_data)}",
+    ]
+    if include_downweighted:
+        parts.append(
+            f"downweighted={selected.sum().item()} ({selected.float().mean().item():.1%})"
+        )
+    parts.extend(
+        [
+            f"{eval_prefix}={eval_index}",
+            f"LoRA r={args.lora_r}",
+            f"alpha={args.lora_alpha}",
+            f"targets={args.lora_target_modules}",
+            f"micro batch size={args.batch_size}",
+            f"grad accum={args.gradient_accumulation_steps}",
+            f"effective batch size={args.batch_size * args.gradient_accumulation_steps}",
+            f"epochs={args.epochs}",
+            f"steps per epoch={(len(epoch_indices[0]) + args.batch_size - 1) // args.batch_size}",
+            f"optimizer steps per run={((args.epochs * ((len(epoch_indices[0]) + args.batch_size - 1) // args.batch_size)) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps}",
+            f"download={'on' if args.download else 'off'}",
+        ]
+    )
+    return ", ".join(parts)
 
 
 def make_generator(seed):
@@ -77,38 +199,8 @@ def reset_training_rng(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def make_poly_parameters(module, degree):
-    for child in module.children():
-        make_poly_parameters(child, degree)
-
-    for name, param in list(module._parameters.items()):
-        if param is None or not param.requires_grad:
-            continue
-        coeffs = (param.detach().clone(),) + tuple(torch.zeros_like(param) for _ in range(degree))
-        module._parameters[name] = nn.Parameter(
-            PolyTensor(coeffs, requires_grad=param.requires_grad),
-            requires_grad=param.requires_grad,
-        )
-
-
 def split_csv(values):
     return [value.strip() for value in values.split(",") if value.strip()]
-
-
-def assert_only_poly_parameters_trainable(module):
-    bad_params = [
-        (name, type(param).__name__)
-        for name, param in module.named_parameters()
-        if param.requires_grad and not isinstance(param, PolyTensor)
-    ]
-    if bad_params:
-        preview = ", ".join(f"{name} ({type_name})" for name, type_name in bad_params[:10])
-        if len(bad_params) > 10:
-            preview += f", ... and {len(bad_params) - 10} more"
-        raise RuntimeError(
-            "expected polynomial training to leave only PolyTensor parameters trainable; "
-            f"found trainable non-PolyTensor parameters: {preview}"
-        )
 
 
 def dtype_from_name(name):
@@ -209,20 +301,87 @@ def with_eos(text, tokenizer):
     return text + tokenizer.eos_token
 
 
+def has_chat_template(tokenizer):
+    return (
+        callable(getattr(tokenizer, "apply_chat_template", None))
+        and getattr(tokenizer, "chat_template", None) is not None
+    )
+
+
+def apply_chat_template_text(tokenizer, messages, add_generation_prompt):
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": add_generation_prompt,
+        "enable_thinking": False,
+    }
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError as error:
+        if "enable_thinking" not in str(error):
+            raise
+        del kwargs["enable_thinking"]
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def format_chat_pair(tokenizer, user_content, assistant_content):
+    prompt_messages = [{"role": "user", "content": user_content}]
+    full_messages = prompt_messages + [
+        {"role": "assistant", "content": assistant_content}
+    ]
+    prompt = apply_chat_template_text(
+        tokenizer,
+        prompt_messages,
+        add_generation_prompt=True,
+    )
+    full_text = apply_chat_template_text(
+        tokenizer,
+        full_messages,
+        add_generation_prompt=False,
+    )
+    return prompt, full_text
+
+
+def format_generation_prompt(tokenizer, question):
+    if has_chat_template(tokenizer):
+        prompt = apply_chat_template_text(
+            tokenizer,
+            [{"role": "user", "content": text_or_empty(question)}],
+            add_generation_prompt=True,
+        )
+        return prompt, False
+    return question.strip() + "\n\n", True
+
+
 def format_example(example, tokenizer, args):
     if args.text_column is not None:
         if args.text_column not in example:
             raise ValueError(f"text column {args.text_column!r} was not found")
         return None, text_or_empty(example[args.text_column])
 
-    if "messages" in example and hasattr(tokenizer, "apply_chat_template"):
+    if "messages" in example and has_chat_template(tokenizer):
         messages = example["messages"]
         if isinstance(messages, list):
+            if (
+                len(messages) > 1
+                and isinstance(messages[-1], dict)
+                and messages[-1].get("role") == "assistant"
+            ):
+                prompt = apply_chat_template_text(
+                    tokenizer,
+                    messages[:-1],
+                    add_generation_prompt=True,
+                )
+                full_text = apply_chat_template_text(
+                    tokenizer,
+                    messages,
+                    add_generation_prompt=False,
+                )
+                return prompt, full_text
             return (
                 None,
-                tokenizer.apply_chat_template(
+                apply_chat_template_text(
+                    tokenizer,
                     messages,
-                    tokenize=False,
                     add_generation_prompt=False,
                 ),
             )
@@ -231,6 +390,11 @@ def format_example(example, tokenizer, args):
         instruction = text_or_empty(example.get("instruction"))
         input_text = text_or_empty(example.get("input"))
         output = text_or_empty(example.get("output"))
+        if has_chat_template(tokenizer):
+            user_content = instruction
+            if input_text:
+                user_content = f"{instruction}\n\n{input_text}"
+            return format_chat_pair(tokenizer, user_content, output)
         if input_text:
             prompt = (
                 "### Instruction:\n"
@@ -249,14 +413,18 @@ def format_example(example, tokenizer, args):
 
     for prompt_key, response_key in (("prompt", "completion"), ("question", "answer")):
         if prompt_key in example and response_key in example:
-            prompt = f"{text_or_empty(example[prompt_key])}\n\n"
-            return prompt, with_eos(prompt + text_or_empty(example[response_key]), tokenizer)
+            prompt_text = text_or_empty(example[prompt_key])
+            response_text = text_or_empty(example[response_key])
+            if has_chat_template(tokenizer):
+                return format_chat_pair(tokenizer, prompt_text, response_text)
+            prompt = f"{prompt_text}\n\n"
+            return prompt, with_eos(prompt + response_text, tokenizer)
 
     if "text" in example:
         return None, text_or_empty(example["text"])
 
     raise ValueError(
-        "could not infer how to format dataset rows; pass --text-column for this dataset"
+        "could not infer how to format dataset rows; pass text_column in the config for this dataset"
     )
 
 
@@ -321,17 +489,52 @@ def make_data(args, tokenizer):
     train_data = TokenizedTextDataset(train_examples, tokenizer, args)
     eval_data = TokenizedTextDataset(eval_examples, tokenizer, args)
 
+    selected = make_downweight_selection(len(train_data), args)
+
+    return train_data, eval_data, selected, int(eval_index)
+
+
+def make_train_eval_data(args, tokenizer, num_eval_examples):
+    raw = load_raw_dataset(args)
+    if len(raw) < 2:
+        raise ValueError("need at least two examples: one for training and one for evaluation")
+    if num_eval_examples < 1:
+        raise ValueError("num_eval_examples must be at least 1")
+    if num_eval_examples >= len(raw):
+        raise ValueError("num_eval_examples must leave at least one training example")
+
+    raw = raw.shuffle(seed=args.seed + 10)
+    eval_start = 0 if args.eval_index is None else args.eval_index
+    eval_stop = eval_start + num_eval_examples
+    if not 0 <= eval_start < len(raw) or eval_stop > len(raw):
+        raise ValueError("validation range is outside the dataset")
+
+    eval_indices = set(range(eval_start, eval_stop))
+    train_indices = [idx for idx in range(len(raw)) if idx not in eval_indices]
+    train_indices = train_indices[: args.max_train_examples]
+    if not train_indices:
+        raise ValueError("no training examples selected")
+
+    train_examples = [raw[int(idx)] for idx in train_indices]
+    eval_examples = [raw[int(idx)] for idx in range(eval_start, eval_stop)]
+    train_data = TokenizedTextDataset(train_examples, tokenizer, args)
+    eval_data = TokenizedTextDataset(eval_examples, tokenizer, args)
+    selected = make_downweight_selection(len(train_data), args)
+
+    return train_data, eval_data, selected, (int(eval_start), int(eval_stop - 1))
+
+
+def make_downweight_selection(num_examples, args):
     selection_generator = make_generator(args.seed + 20)
-    num_downweighted = int(round(args.downweight_fraction * len(train_data)))
-    num_downweighted = min(len(train_data), max(1, num_downweighted))
-    selected = torch.zeros(len(train_data), dtype=torch.bool)
+    num_downweighted = int(round(args.downweight_fraction * num_examples))
+    num_downweighted = min(num_examples, max(1, num_downweighted))
+    selected = torch.zeros(num_examples, dtype=torch.bool)
     selected_indices = torch.randperm(
-        len(train_data),
+        num_examples,
         generator=selection_generator,
     )[:num_downweighted]
     selected[selected_indices] = True
-
-    return train_data, eval_data, selected, int(eval_index)
+    return selected
 
 
 def make_epoch_indices(num_examples, epochs, seed):
@@ -342,7 +545,7 @@ def make_epoch_indices(num_examples, epochs, seed):
     ]
 
 
-def make_model(args, device, degree=None):
+def make_model(args, device):
     torch.manual_seed(args.seed + 40)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed + 40)
@@ -377,10 +580,6 @@ def make_model(args, device, degree=None):
             model.enable_input_require_grads()
 
     model.to(device)
-
-    if degree is not None:
-        make_poly_parameters(model, degree)
-        assert_only_poly_parameters_trainable(model)
 
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if num_trainable == 0:
@@ -419,13 +618,7 @@ def forward_per_example_loss(model, batch, loss_fn):
     return causal_lm_per_example_loss(outputs.logits, batch["labels"], loss_fn)
 
 
-def zeros_like_parameter(param):
-    if isinstance(param, PolyTensor):
-        return PolyTensor(tuple(torch.zeros_like(coeff) for coeff in param.coeffs))
-    return torch.zeros_like(param)
-
-
-class AdamWForPolyTensor:
+class AdamWForParameters:
     def __init__(self, params, betas, eps, weight_decay):
         self.params = list(params)
         self.beta1, self.beta2 = betas
@@ -451,8 +644,8 @@ class AdamWForPolyTensor:
                 if state is None:
                     state = {
                         "step": 0,
-                        "exp_avg": zeros_like_parameter(param),
-                        "exp_avg_sq": zeros_like_parameter(param),
+                        "exp_avg": torch.zeros_like(param),
+                        "exp_avg_sq": torch.zeros_like(param),
                     }
                     self.state[id(param)] = state
 
@@ -491,7 +684,7 @@ def scheduled_learning_rate(args, optimizer_step, total_optimizer_steps, warmup_
 
 def make_optimizer(model, args):
     trainable_params = [param for param in model.parameters() if param.requires_grad]
-    return AdamWForPolyTensor(
+    return AdamWForParameters(
         trainable_params,
         betas=(args.beta1, args.beta2),
         eps=args.eps,
@@ -512,10 +705,14 @@ def train_one_epoch(
     optimizer_step,
     total_optimizer_steps,
     warmup_steps,
+    loss_value_fn=None,
 ):
     model.train()
     total_loss = 0.0
     total = 0
+
+    if loss_value_fn is None:
+        loss_value_fn = lambda value: value
 
     progress = tqdm(loader, disable=quiet, leave=False)
     optimizer.zero_grad(set_to_none=True)
@@ -532,7 +729,7 @@ def train_one_epoch(
         scaled_loss.backward()
 
         batch_size = per_example_loss.shape[0]
-        total_loss += tensor_value(loss).detach().float().item() * batch_size
+        total_loss += loss_value_fn(loss).detach().float().item() * batch_size
         total += batch_size
         if batch_step % args.gradient_accumulation_steps == 0 or batch_step == len(loader):
             optimizer_step += 1
@@ -551,10 +748,21 @@ def train_one_epoch(
     return total_loss / total, optimizer_step
 
 
-def train_model(model, train_data, selected, downweight, epoch_indices, collator, args, device):
+def train_model(
+    model,
+    train_data,
+    selected,
+    downweight,
+    epoch_indices,
+    collator,
+    args,
+    device,
+    make_optimizer_fn=make_optimizer,
+    loss_value_fn=None,
+):
     reset_training_rng(args.seed + 60)
     loss_fn = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
-    optimizer = make_optimizer(model, args)
+    optimizer = make_optimizer_fn(model, args)
     batches_per_epoch = (len(train_data) + args.batch_size - 1) // args.batch_size
     total_batches = args.epochs * batches_per_epoch
     total_optimizer_steps = (
@@ -586,21 +794,30 @@ def train_model(model, train_data, selected, downweight, epoch_indices, collator
             optimizer_step,
             total_optimizer_steps,
             warmup_steps,
+            loss_value_fn=loss_value_fn,
         )
         if not args.quiet:
             print(f"  epoch {epoch}: train token loss {train_loss:.4f}")
 
 
-def eval_loss(model, eval_data, collator, device):
+def eval_loss(model, eval_data, collator, device, batch_size=1):
     loss_fn = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
-    loader = DataLoader(eval_data, batch_size=1, collate_fn=collator)
+    loader = DataLoader(eval_data, batch_size=batch_size, collate_fn=collator)
     model.eval()
 
+    total_loss = None
+    total = 0
     with torch.no_grad():
-        batch = next(iter(loader))
-        batch = batch_to_device(batch, device)
-        per_example_loss = forward_per_example_loss(model, batch, loss_fn)
-        return per_example_loss.sum()
+        for batch in loader:
+            batch = batch_to_device(batch, device)
+            per_example_loss = forward_per_example_loss(model, batch, loss_fn)
+            batch_loss = per_example_loss.sum()
+            total_loss = batch_loss if total_loss is None else total_loss + batch_loss
+            total += per_example_loss.shape[0]
+
+    if total == 0:
+        raise ValueError("validation dataset is empty")
+    return total_loss / total
 
 
 def cleanup_model(model):
@@ -608,223 +825,3 @@ def cleanup_model(model):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-def polynomial_coefficients(train_data, eval_data, selected, epoch_indices, collator, args, device):
-    z = PolyTensor(
-        [torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)],
-        degree=args.degree,
-    )
-    model = make_model(args, device, degree=args.degree)
-
-    print("training PolyTensor LLM fine-tune for Taylor coefficients")
-    train_model(model, train_data, selected, z, epoch_indices, collator, args, device)
-    loss = eval_loss(model, eval_data, collator, device)
-    if not isinstance(loss, PolyTensor):
-        raise TypeError("expected the evaluation loss to be a PolyTensor")
-    coefficients = [coeff.detach().float().cpu().item() for coeff in loss.coeffs]
-    cleanup_model(model)
-    return coefficients
-
-
-def retrained_losses(train_data, eval_data, selected, epoch_indices, collator, args, device):
-    zs = torch.linspace(0.0, 1.0, args.num_dots).tolist()
-    losses = []
-
-    for z in zs:
-        print(f"retraining LLM fine-tune at z={z:.2f}")
-        model = make_model(args, device)
-        if z == 0.0:
-            before_loss = eval_loss(model, eval_data, collator, device).detach().float().cpu().item()
-            print(f"  z=0 eval token loss before training: {before_loss:.4f}")
-        train_model(model, train_data, selected, z, epoch_indices, collator, args, device)
-        loss = eval_loss(model, eval_data, collator, device)
-        after_loss = tensor_value(loss).detach().float().cpu().item()
-        if z == 0.0:
-            print(f"  z=0 eval token loss after training: {after_loss:.4f}")
-        losses.append(after_loss)
-        cleanup_model(model)
-
-    return zs, losses
-
-
-def evaluate_polynomial(coefficients, zs, degree):
-    ys = torch.zeros_like(zs)
-    for power in range(degree + 1):
-        ys = ys + coefficients[power] * zs.pow(power)
-    return ys
-
-
-def plot_results(zs, retrained, coefficients, num_trained_examples, num_downweighted, args):
-    grid = torch.linspace(0.0, 1.0, 301, dtype=torch.float64)
-
-    fig, ax = plt.subplots(figsize=(7.0, 4.6))
-    ax.scatter(zs, retrained, color="black", label="retrained", zorder=3)
-
-    for degree in range(1, args.degree + 1):
-        approx = evaluate_polynomial(coefficients, grid, degree)
-        ax.plot(grid, approx, label=f"degree {degree}", linewidth=2)
-
-    ax.set_xlabel("downweight z")
-    ax.set_ylabel("loss f(z 1_D)")
-    ax.set_title("LLM fine-tuning deletion Taylor approximations")
-    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
-    ax.text(
-        0.01,
-        0.99,
-        (
-            f"n={num_trained_examples}, batch size={effective_batch_size}, "
-            f"deletions={num_downweighted}\n"
-            f"LoRA r={args.lora_r}, epochs={args.epochs}"
-        ),
-        transform=ax.transAxes,
-        va="top",
-        fontsize=8,
-    )
-    ax.ticklabel_format(axis="y", style="plain", useOffset=False)
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=args.dpi)
-    plt.close(fig)
-    print(f"saved {output_path}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Reproduce a Figure-2-style Taylor approximation plot for LLM fine-tuning."
-    )
-    parser.add_argument("--model-name", default=MODEL_NAME)
-    parser.add_argument("--dataset-name", default=DATASET_NAME)
-    parser.add_argument("--dataset-config")
-    parser.add_argument("--dataset-split", default="train")
-    parser.add_argument("--jsonl", help="Optional local JSONL dataset; overrides --dataset-name.")
-    parser.add_argument("--text-column")
-    parser.add_argument("--cache-dir")
-    parser.add_argument("--output", default=OUTPUT_PATH)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
-    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
-    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
-    parser.add_argument("--beta1", type=float, default=BETAS[0])
-    parser.add_argument("--beta2", type=float, default=BETAS[1])
-    parser.add_argument("--eps", type=float, default=EPS)
-    parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        default=GRADIENT_ACCUMULATION_STEPS,
-    )
-    parser.add_argument("--warmup-ratio", type=float, default=WARMUP_RATIO)
-    parser.add_argument("--warmup-steps", type=int)
-    parser.add_argument("--min-learning-rate-ratio", type=float, default=0.0)
-    parser.add_argument("--downweight-fraction", type=float, default=DOWNWEIGHT_FRACTION)
-    parser.add_argument("--degree", type=int, default=DEGREE)
-    parser.add_argument("--num-dots", type=int, default=NUM_DOTS)
-    parser.add_argument("--max-train-examples", type=int, default=MAX_TRAIN_EXAMPLES)
-    parser.add_argument("--max-length", type=int, default=MAX_LENGTH)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--eval-index", type=int)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--pad-to-multiple-of", type=int, default=8)
-    parser.add_argument("--dpi", type=int, default=200)
-    parser.add_argument("--lora-r", type=int, default=LORA_R)
-    parser.add_argument("--lora-alpha", type=int, default=LORA_ALPHA)
-    parser.add_argument("--lora-dropout", type=float, default=LORA_DROPOUT)
-    parser.add_argument("--lora-target-modules", default=LORA_TARGET_MODULES)
-    parser.add_argument(
-        "--no-gradient-checkpointing",
-        dest="gradient_checkpointing",
-        action="store_false",
-    )
-    parser.set_defaults(gradient_checkpointing=GRADIENT_CHECKPOINTING)
-    parser.add_argument(
-        "--dtype",
-        choices=("auto", "float32", "bfloat16", "float16"),
-        default=DTYPE,
-    )
-    parser.add_argument("--attn-implementation", default="eager")
-    parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--download", action="store_true")
-    parser.add_argument("--quiet", action="store_true")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-    if args.degree < 1:
-        raise ValueError("--degree must be at least 1")
-    if args.degree != DEGREE:
-        print(f"using degree {args.degree}; pass no --degree flag for the requested degree 3")
-    if not 0.0 <= args.downweight_fraction <= 1.0:
-        raise ValueError("--downweight-fraction must be between 0 and 1")
-    if args.num_dots < 2:
-        raise ValueError("--num-dots must be at least 2")
-    if args.max_train_examples < 1:
-        raise ValueError("--max-train-examples must be at least 1")
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be at least 1")
-    if args.gradient_accumulation_steps < 1:
-        raise ValueError("--gradient-accumulation-steps must be at least 1")
-    if args.max_length < 2:
-        raise ValueError("--max-length must be at least 2")
-    if not 0.0 <= args.warmup_ratio <= 1.0:
-        raise ValueError("--warmup-ratio must be between 0 and 1")
-    if not 0.0 <= args.min_learning_rate_ratio <= 1.0:
-        raise ValueError("--min-learning-rate-ratio must be between 0 and 1")
-    if args.lora_r < 1:
-        raise ValueError("--lora-r must be at least 1")
-    if args.lora_alpha < 1:
-        raise ValueError("--lora-alpha must be at least 1")
-    if not 0.0 <= args.lora_dropout < 1.0:
-        raise ValueError("--lora-dropout must be in [0, 1)")
-    if not split_csv(args.lora_target_modules):
-        raise ValueError("--lora-target-modules must include at least one module name")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = load_tokenizer(args)
-    collator = CausalLMCollator(tokenizer, args.pad_to_multiple_of)
-    train_data, eval_data, selected, eval_index = make_data(args, tokenizer)
-    epoch_indices = make_epoch_indices(len(train_data), args.epochs, args.seed + 50)
-
-    print(
-        f"device={device}, model={args.model_name}, train examples={len(train_data)}, "
-        f"downweighted={selected.sum().item()} ({selected.float().mean().item():.1%}), "
-        f"eval row={eval_index}, LoRA r={args.lora_r}, alpha={args.lora_alpha}, "
-        f"targets={args.lora_target_modules}, "
-        f"micro batch size={args.batch_size}, grad accum={args.gradient_accumulation_steps}, "
-        f"effective batch size={args.batch_size * args.gradient_accumulation_steps}, "
-        f"epochs={args.epochs}, "
-        f"steps per epoch={(len(epoch_indices[0]) + args.batch_size - 1) // args.batch_size}, "
-        f"optimizer steps per run={((args.epochs * ((len(epoch_indices[0]) + args.batch_size - 1) // args.batch_size)) + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps}, "
-        f"download={'on' if args.download else 'off'}"
-    )
-
-    coefficients = polynomial_coefficients(
-        train_data,
-        eval_data,
-        selected,
-        epoch_indices,
-        collator,
-        args,
-        device,
-    )
-    print("Taylor coefficients:", ", ".join(f"{c:.6g}" for c in coefficients))
-
-    zs, empirical = retrained_losses(
-        train_data,
-        eval_data,
-        selected,
-        epoch_indices,
-        collator,
-        args,
-        device,
-    )
-    num_trained_examples = sum(len(indices) for indices in epoch_indices)
-    plot_results(zs, empirical, coefficients, num_trained_examples, selected.sum().item(), args)
-
-
-if __name__ == "__main__":
-    main()
