@@ -5,15 +5,18 @@ import torch
 from train import (
     CausalLMCollator,
     DEFAULT_CONFIG_PATH,
+    TokenizedTextDataset,
     cleanup_model,
     eval_loss,
     format_generation_prompt,
     format_run_summary,
     load_args_from_config,
+    load_raw_dataset,
     load_tokenizer,
+    make_downweight_selection,
     make_epoch_indices,
     make_model,
-    make_train_eval_data,
+    text_or_empty,
     train_model,
     validate_training_args,
 )
@@ -39,9 +42,22 @@ def parse_args():
         default=TOP_K,
         help=f"Number of post-training next-token candidates to print. Default: {TOP_K}.",
     )
+    parser.add_argument(
+        "--train-only",
+        default=None,
+        help=(
+            "Restrict training to rows whose question or answer contains this "
+            "case-insensitive text."
+        ),
+    )
     cli_args = parser.parse_args()
     if cli_args.top_k < 1:
         raise ValueError("--top-k must be at least 1")
+    train_only = None
+    if cli_args.train_only is not None:
+        train_only = cli_args.train_only.strip()
+        if not train_only:
+            raise ValueError("--train-only must not be empty")
 
     args = load_args_from_config(
         cli_args.config,
@@ -52,7 +68,77 @@ def parse_args():
         },
     )
     args.top_k = cli_args.top_k
+    args.train_only = train_only
     return args
+
+
+def question_answer_text(example):
+    if "question" not in example or "answer" not in example:
+        raise ValueError(
+            "--train-only expects dataset rows with question and answer columns"
+        )
+    return "\n".join(
+        [
+            text_or_empty(example["question"]),
+            text_or_empty(example["answer"]),
+        ]
+    )
+
+
+def matches_train_only(example, train_only):
+    if train_only is None:
+        return True
+    return train_only.casefold() in question_answer_text(example).casefold()
+
+
+def make_train_questions_data(args, tokenizer):
+    raw = load_raw_dataset(args)
+    if len(raw) < 1:
+        raise ValueError("need at least one training example")
+    if args.num_eval_examples > 0 and len(raw) < 2:
+        raise ValueError(
+            "need at least two examples: one for training and one for evaluation"
+        )
+    if args.num_eval_examples > 0 and args.num_eval_examples >= len(raw):
+        raise ValueError("num_eval_examples must leave at least one training example")
+
+    raw = raw.shuffle(seed=args.seed + 10)
+    eval_indices = set()
+    eval_data = None
+    eval_description = "none (num_eval_examples=0)"
+
+    if args.num_eval_examples > 0:
+        eval_start = 0 if args.eval_index is None else args.eval_index
+        eval_stop = eval_start + args.num_eval_examples
+        if not 0 <= eval_start < len(raw) or eval_stop > len(raw):
+            raise ValueError("validation range is outside the dataset")
+
+        eval_indices = set(range(eval_start, eval_stop))
+        eval_examples = [raw[int(idx)] for idx in range(eval_start, eval_stop)]
+        eval_data = TokenizedTextDataset(eval_examples, tokenizer, args)
+        eval_description = (
+            f"{eval_start}..{eval_stop - 1} ({len(eval_data)} examples)"
+        )
+
+    train_indices = []
+    for idx in range(len(raw)):
+        if idx in eval_indices:
+            continue
+        if matches_train_only(raw[int(idx)], args.train_only):
+            train_indices.append(idx)
+    train_indices = train_indices[: args.max_train_examples]
+    if not train_indices:
+        if args.train_only is None:
+            raise ValueError("no training examples selected")
+        raise ValueError(
+            f"no training examples matched --train-only={args.train_only!r}"
+        )
+
+    train_examples = [raw[int(idx)] for idx in train_indices]
+    train_data = TokenizedTextDataset(train_examples, tokenizer, args)
+    selected = make_downweight_selection(len(train_data), args)
+
+    return train_data, eval_data, selected, eval_description
 
 
 def trainable_state(model):
@@ -209,53 +295,56 @@ def interactive_phase(model, tokenizer, device, before_state, trained_state, top
 
 def main():
     args = parse_args()
-    validate_training_args(args)
+    validate_training_args(args, allow_zero_eval_examples=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = load_tokenizer(args)
     collator = CausalLMCollator(tokenizer, args.pad_to_multiple_of)
-    train_data, eval_data, selected, eval_range = make_train_eval_data(
+    train_data, eval_data, selected, eval_description = make_train_questions_data(
         args,
         tokenizer,
-        args.num_eval_examples,
     )
     epoch_indices = make_epoch_indices(len(train_data), args.epochs, args.seed + 50)
-    eval_description = f"{eval_range[0]}..{eval_range[1]} ({len(eval_data)} examples)"
 
-    print(
-        format_run_summary(
-            args,
-            train_data,
-            selected,
-            eval_description,
-            epoch_indices,
-            include_downweighted=False,
-        )
+    summary = format_run_summary(
+        args,
+        train_data,
+        selected,
+        eval_description,
+        epoch_indices,
+        include_downweighted=False,
     )
+    if args.train_only is not None:
+        summary += f", train only={args.train_only!r}"
+    print(summary)
 
     model = make_model(args, device)
     before_state = trainable_state(model)
 
-    before_loss = eval_loss(
-        model,
-        eval_data,
-        collator,
-        device,
-        batch_size=args.batch_size,
-    ).detach().float().cpu().item()
-    print(f"validation token loss before training: {before_loss:.6g}")
+    if eval_data is None:
+        print("validation skipped (num_eval_examples=0)")
+    else:
+        before_loss = eval_loss(
+            model,
+            eval_data,
+            collator,
+            device,
+            batch_size=args.batch_size,
+        ).detach().float().cpu().item()
+        print(f"validation token loss before training: {before_loss:.6g}")
 
     train_model(model, train_data, selected, 0.0, epoch_indices, collator, args, device)
     trained_state = trainable_state(model)
 
-    after_loss = eval_loss(
-        model,
-        eval_data,
-        collator,
-        device,
-        batch_size=args.batch_size,
-    ).detach().float().cpu().item()
-    print(f"validation token loss after training: {after_loss:.6g}")
+    if eval_data is not None:
+        after_loss = eval_loss(
+            model,
+            eval_data,
+            collator,
+            device,
+            batch_size=args.batch_size,
+        ).detach().float().cpu().item()
+        print(f"validation token loss after training: {after_loss:.6g}")
 
     interactive_phase(
         model,
