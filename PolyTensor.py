@@ -169,6 +169,78 @@ class PolyTensor(torch.Tensor):
                 s = s + x
             return s
 
+        def unstack_coeffs(y):
+            return tuple(y.unbind(0))
+
+        def matmul_poly_tensor(A, b):
+            if A[0].dim() < 2 or b.dim() < 2:
+                return None
+            return unstack_coeffs(torch.matmul(torch.stack(A), b))
+
+        def matmul_tensor_poly(a, B):
+            if a.dim() < 2 or B[0].dim() < 2:
+                return None
+            B_stack = torch.stack(B)
+            extra_batch_dims = max(0, a.dim() - B[0].dim())
+            B_stack = B_stack.reshape(
+                (D + 1,) + (1,) * extra_batch_dims + B_stack.shape[1:]
+            )
+            return unstack_coeffs(torch.matmul(a.unsqueeze(0), B_stack))
+
+        def matmul(a, b):
+            a_is_poly = is_poly(a)
+            b_is_poly = is_poly(b)
+            if a_is_poly and not b_is_poly:
+                out = matmul_poly_tensor(a.coeffs, b)
+                if out is not None:
+                    return out
+            if b_is_poly and not a_is_poly:
+                out = matmul_tensor_poly(a, b.coeffs)
+                if out is not None:
+                    return out
+            return bilinear(torch.matmul, a, b)
+
+        def bmm_poly_tensor(A, b):
+            if A[0].dim() != 3 or b.dim() != 3:
+                return None
+            batch, left, inner = A[0].shape
+            right = b.shape[-1]
+            A_stack = torch.stack(A).reshape((D + 1) * batch, left, inner)
+            b_stack = (
+                b.unsqueeze(0)
+                .expand(D + 1, *b.shape)
+                .reshape((D + 1) * batch, inner, right)
+            )
+            y = torch.bmm(A_stack, b_stack).reshape(D + 1, batch, left, right)
+            return unstack_coeffs(y)
+
+        def bmm_tensor_poly(a, B):
+            if a.dim() != 3 or B[0].dim() != 3:
+                return None
+            batch, left, inner = a.shape
+            right = B[0].shape[-1]
+            a_stack = (
+                a.unsqueeze(0)
+                .expand(D + 1, *a.shape)
+                .reshape((D + 1) * batch, left, inner)
+            )
+            B_stack = torch.stack(B).reshape((D + 1) * batch, inner, right)
+            y = torch.bmm(a_stack, B_stack).reshape(D + 1, batch, left, right)
+            return unstack_coeffs(y)
+
+        def bmm(a, b):
+            a_is_poly = is_poly(a)
+            b_is_poly = is_poly(b)
+            if a_is_poly and not b_is_poly:
+                out = bmm_poly_tensor(a.coeffs, b)
+                if out is not None:
+                    return out
+            if b_is_poly and not a_is_poly:
+                out = bmm_tensor_poly(a, b.coeffs)
+                if out is not None:
+                    return out
+            return bilinear(torch.bmm, a, b)
+
         def bilinear(op, a, b):
             a_is_poly = is_poly(a)
             b_is_poly = is_poly(b)
@@ -446,13 +518,13 @@ class PolyTensor(torch.Tensor):
             return wrap(poly_reciprocal(lift(args[0])))
 
         if func is aten.mm.default:
-            return wrap(bilinear(torch.mm, args[0], args[1]))
+            return wrap(matmul(args[0], args[1]))
 
         if func is aten.matmul.default:
-            return correct(wrap(bilinear(torch.matmul, args[0], args[1])))
+            return correct(wrap(matmul(args[0], args[1])))
 
         if func is aten.bmm.default:
-            return correct(wrap(bilinear(torch.bmm, args[0], args[1])))
+            return correct(wrap(bmm(args[0], args[1])))
 
         if func is aten.scaled_dot_product_attention.default:
             query, key, value = args[:3]
@@ -514,17 +586,57 @@ class PolyTensor(torch.Tensor):
             x, a, b = args[:3]
             beta = kwargs.get("beta", 1)
             alpha = kwargs.get("alpha", 1)
-            X = lift(x)
-            M = bilinear(torch.mm, a, b)
-            return wrap(beta * X[k] + alpha * M[k] for k in range(D + 1))
+            M = matmul(a, b)
+            if is_poly(x):
+                X = x.coeffs
+                return wrap(beta * X[k] + alpha * M[k] for k in range(D + 1))
+            out = [alpha * m for m in M]
+            out[0] = beta * x + out[0]
+            return wrap(out)
 
         if func is aten.linear.default:
             x, weight = args[:2]
             bias = args[2] if len(args) > 2 else kwargs.get("bias")
-            Y = bilinear(lambda a, b: torch.matmul(a, b.transpose(-2, -1)), x, weight)
+            if is_poly(weight):
+                if is_poly(x):
+                    Y = bilinear(
+                        lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
+                        x,
+                        weight,
+                    )
+                else:
+                    weight_t = tuple(w.transpose(-2, -1) for w in weight.coeffs)
+                    Y = matmul_tensor_poly(x, weight_t)
+                    if Y is None:
+                        Y = bilinear(
+                            lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
+                            x,
+                            weight,
+                        )
+            elif is_poly(x):
+                Y = matmul_poly_tensor(
+                    x.coeffs,
+                    weight.transpose(-2, -1),
+                )
+                if Y is None:
+                    Y = bilinear(
+                        lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
+                        x,
+                        weight,
+                    )
+            else:
+                Y = bilinear(
+                    lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
+                    x,
+                    weight,
+                )
             if bias is not None:
-                B = lift(bias)
-                Y = [Y[k] + B[k] for k in range(D + 1)]
+                if is_poly(bias):
+                    B = bias.coeffs
+                    Y = [Y[k] + B[k] for k in range(D + 1)]
+                else:
+                    Y = list(Y)
+                    Y[0] = Y[0] + bias
             return wrap(Y)
 
         if func in (aten.convolution.default, aten.conv2d.default):
@@ -804,7 +916,7 @@ class PolyTensor(torch.Tensor):
             X = lift(x)
             y0, mask = func(X[0], p, train)
             if not train or p == 0:
-                return wrap((y0, *X[1:]), clone=True), mask
+                return correct((wrap((y0, *X[1:])), mask))
             if p == 1:
                 return wrap(torch.zeros_like(c) for c in X), mask
             scale = 1.0 / (1.0 - p)
@@ -816,11 +928,12 @@ class PolyTensor(torch.Tensor):
             p = args[1] if len(args) > 1 else kwargs["p"]
             train = args[2] if len(args) > 2 else kwargs["train"]
             X = lift(x)
-            y, mask = aten.native_dropout.default(X[0], p, train)
             if not train or p == 0:
-                return wrap((y, *X[1:]), clone=True)
+                y = func(X[0], p, train)
+                return correct(wrap((y, *X[1:])))
             if p == 1:
                 return wrap(torch.zeros_like(c) for c in X)
+            y, mask = aten.native_dropout.default(X[0], p, train)
             mask = mask.to(dtype=X[0].dtype)
             scale = 1.0 / (1.0 - p)
             return wrap((y, *(c * mask * scale for c in X[1:])))

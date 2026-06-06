@@ -1,0 +1,25 @@
+{
+  "format": "fig2_answer_prefix_plot",
+  "metric": "log_probability",
+  "no_polys": true,
+  "precompute_dir": "data/small-batch",
+  "question": "Where was Chukwu Akabueze born?",
+  "answer_prefix": "Chukwu Akabueze is from the city of",
+  "answer": " Lagos",
+  "full_answer": "Chukwu Akabueze is from the city of Lagos",
+  "scored_answer": " Lagos",
+  "conditioned_answer_prefix": "Chukwu Akabueze is from the city of",
+  "answer_token_count": 1,
+  "zs": [
+    0.0,
+    1.0
+  ],
+  "retrained_values": [
+    -2.5710959434509277,
+    -2.742509365081787
+  ],
+  "retrained_log_probabilities": [
+    -2.5710959434509277,
+    -2.742509365081787
+  ]
+}
