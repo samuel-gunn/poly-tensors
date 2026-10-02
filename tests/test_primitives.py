@@ -102,7 +102,7 @@ def test_coefficient_autograd_gradient_jet_matches_finite_differences():
         x0_value,
         direction,
     )
-    assert torch.equal(gradient_coefficients[0], finite_difference[0])
+    torch.testing.assert_close(gradient_coefficients[0], finite_difference[0], rtol=2e-14, atol=1e-15)
     for order in range(1, 4):
         torch.testing.assert_close(
             gradient_coefficients[order],
@@ -169,18 +169,18 @@ def test_softmax_and_logsumexp_jets_are_rooted_at_native_float32_values():
         direction - expected_first_probability_normalizer.unsqueeze(-1)
     )
 
-    # Exact equality is intentional: coefficient zero is the native kernel and
-    # coefficient one is generated directly from that stored value.  The old
-    # exp/sum implementation differed by roughly 1e-6 for this float32 case.
+    # Coefficient zero is exactly the native kernel. Higher coefficients
+    # remove common shifts before the recurrence to avoid overflow, so their
+    # operation order (and hence roundoff) differs from this direct formula.
     assert torch.equal(probability.coeffs[0], native_probability)
     assert torch.equal(normalizer.coeffs[0], native_normalizer)
-    assert torch.equal(probability.coeffs[1], expected_first_probability)
-    assert torch.equal(normalizer.coeffs[1], expected_first_normalizer)
+    torch.testing.assert_close(probability.coeffs[1], expected_first_probability)
+    torch.testing.assert_close(normalizer.coeffs[1], expected_first_normalizer)
     expected_first_log_probability = direction - (
         torch.exp(native_log_probability) * direction
     ).sum(dim=-1, keepdim=True)
     assert torch.equal(log_probability.coeffs[0], native_log_probability)
-    assert torch.equal(
+    torch.testing.assert_close(
         log_probability.coeffs[1],
         expected_first_log_probability,
     )
@@ -220,16 +220,18 @@ def test_elementwise_jets_are_rooted_at_native_float32_values():
     activation_jet = _degree_three_line(activation, activation_direction)
     sigmoid = torch.sigmoid(activation_jet)
     sigmoid_zero = torch.sigmoid(activation)
-    sigmoid_first = (
-        sigmoid_zero - sigmoid_zero * sigmoid_zero
-    ) * activation_direction
+    # A rounded float32 sigmoid value must not erase its small derivative.
+    tail = torch.exp(-activation.double().abs())
+    derivative = tail / (1 + tail).square()
+    sigmoid_first = (derivative * activation_direction.double()).float()
     assert torch.equal(sigmoid.coeffs[0], sigmoid_zero)
-    assert torch.equal(sigmoid.coeffs[1], sigmoid_first)
+    torch.testing.assert_close(sigmoid.coeffs[1], sigmoid_first, rtol=2e-6, atol=0)
 
     silu = torch.nn.functional.silu(activation_jet)
-    silu_first = activation * sigmoid_first + activation_direction * sigmoid_zero
+    silu_first = ((torch.sigmoid(activation.double()) + activation.double() * derivative)
+                  * activation_direction.double()).float()
     assert torch.equal(silu.coeffs[0], torch.nn.functional.silu(activation))
-    assert torch.equal(silu.coeffs[1], silu_first)
+    torch.testing.assert_close(silu.coeffs[1], silu_first, rtol=2e-6, atol=0)
 
 
 @pytest.mark.parametrize(

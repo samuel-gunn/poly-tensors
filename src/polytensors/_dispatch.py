@@ -1,7 +1,5 @@
 """PyTorch operator rules for PolyTensor."""
 
-import math
-
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
@@ -63,22 +61,16 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             return (x,) + tuple(torch.zeros_like(x) for _ in range(D))
         return (x,) + tuple(torch.zeros_like(like) for _ in range(D))
 
-    def clone_coeffs(cs):
-        return tuple(c.clone() if isinstance(c, torch.Tensor) else c for c in cs)
-
-    def wrap(cs, *, clone=False):
-        if clone:
-            cs = clone_coeffs(cs)
-        else:
-            cs = tuple(cs)
+    def wrap(cs):
+        cs = tuple(cs)
         # In coefficient-autograd mode, differentiation belongs exclusively
         # to the ordinary coefficient tensors.  Making the storage-less
         # wrapper differentiable would re-enter wrapper-subclass autograd and
         # recreate its lifetime and aliasing constraints.
-        requires_grad = False if coefficient_autograd else any(
-            isinstance(c, torch.Tensor) and c.requires_grad for c in cs
-        )
-        return PolyTensor(cs, requires_grad=requires_grad)
+        # Wrapper autograd belongs to the native outer operation as well:
+        # inferring it from coefficient views pre-populates the output's
+        # metadata before native view autograd can install its own graph.
+        return PolyTensor(cs, requires_grad=False)
 
     def correct(out):
         if coefficient_autograd:
@@ -87,7 +79,55 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             # a storage-less leaf in this mode and is both unnecessary and
             # rejected by autograd.
             return out
-        return return_and_correct_aliasing(func, args, kwargs, out)
+        # Ordinary coefficient views need ADInplaceOrView, but alias correction
+        # here operates on the wrapper itself, whose outer native kernel owns
+        # that metadata. Re-entering the view key on this level would attach it
+        # twice to decomposed view operations.
+        with torch._C._SetExcludeDispatchKeyGuard(torch._C.DispatchKey.ADInplaceOrView, True):
+            return return_and_correct_aliasing(func, args, kwargs, out)
+
+    def preserve_saved_inputs(source, output):
+        # Some native backwards save an activation's output, which can round
+        # to exactly zero/one. Keep its original series for a stable derivative.
+        for attribute in (
+            "_activation_input_coeffs", "_normalization_input_coeffs",
+            "_normalization_dim", "_normalization_excluded",
+        ):
+            if hasattr(source, attribute):
+                setattr(output, attribute, getattr(source, attribute))
+        return output
+
+    def wrap_normalization(coefficients, dim, *, log=False):
+        from ._normalization import normalization_scaled_series
+        from ._range import attach_scaled
+
+        values = (series.poly_log_softmax(coefficients, dim) if log
+                  else series.poly_softmax(coefficients, dim))
+        output = wrap(values)
+        probabilities, normalizers = normalization_scaled_series(coefficients, dim, log)
+        attach_scaled(output, normalizers if log else probabilities)
+        output._normalization_input_coeffs = tuple(coefficients)
+        output._normalization_dim = dim
+        return output
+
+    def wrap_activation(coefficients, kind):
+        from ._activations import _evaluate_scaled, activation_series
+        from ._range import attach_scaled
+
+        output = attach_scaled(wrap(activation_series(coefficients, kind)),
+                               _evaluate_scaled(coefficients, kind, 0))
+        output._activation_input_coeffs = coefficients
+        return output
+
+    def wrap_activation_backward(coefficients, gradient, kind):
+        from ._activations import activation_backward_series
+        from ._range import attach_scaled, get_scaled
+
+        stored_gradients = lift(gradient)
+        values = activation_backward_series(coefficients, get_scaled(gradient) or stored_gradients,
+                                            kind, _return_scaled=True)
+        targets = [torch.promote_types(x.dtype, g.dtype) for x, g in zip(coefficients, stored_gradients)]
+        return attach_scaled(wrap(c.to_tensor(dtype) for c, dtype in zip(values, targets)), values)
 
     def is_poly(x):
         return is_initialized_poly(x)
@@ -130,20 +170,6 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             options["dtype"] = coefficient_dtype(coefficient, options["dtype"])
         return options
 
-    def check_coefficient_storage(destinations, sources):
-        if any(src.is_complex() and not dst.is_complex()
-               for dst, src in zip(destinations, sources)):
-            raise RuntimeError(
-                "cannot copy complex PolyTensor coefficients into real coefficient storage; "
-                "initialize complex directions on the destination first"
-            )
-
-    def copy_coefficients(destinations, sources, *, non_blocking=False):
-        sources = tuple(sources)
-        check_coefficient_storage(destinations, sources)
-        for dst, src in zip(destinations, sources):
-            dst.copy_(src, non_blocking=non_blocking)
-
     schema = getattr(func, "_schema", None)
     name = getattr(schema, "name", "")
     mutates_first_arg = bool(getattr(schema, "is_mutable", False)) or name.rsplit("::", 1)[-1].endswith("_")
@@ -162,99 +188,6 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         for x in xs[1:]:
             s = s + x
         return s
-
-    def unstack_coeffs(y):
-        return tuple(y.unbind(0))
-
-    def matmul_poly_tensor(A, b):
-        if A[0].dim() < 2 or b.dim() < 2:
-            return None
-        if any(c.dtype != b.dtype for c in A):
-            return None
-        A_stack = torch.stack(A)
-        extra_batch_dims = max(0, b.dim() - A[0].dim())
-        A_stack = A_stack.reshape(
-            (D + 1,) + (1,) * extra_batch_dims + A_stack.shape[1:]
-        )
-        out = list(unstack_coeffs(torch.matmul(A_stack, b.unsqueeze(0))))
-        out[0] = torch.matmul(A[0], b)
-        return tuple(out)
-
-    def matmul_tensor_poly(a, B):
-        if a.dim() < 2 or B[0].dim() < 2:
-            return None
-        if any(c.dtype != a.dtype for c in B):
-            return None
-        B_stack = torch.stack(B)
-        extra_batch_dims = max(0, a.dim() - B[0].dim())
-        B_stack = B_stack.reshape(
-            (D + 1,) + (1,) * extra_batch_dims + B_stack.shape[1:]
-        )
-        out = list(unstack_coeffs(torch.matmul(a.unsqueeze(0), B_stack)))
-        out[0] = torch.matmul(a, B[0])
-        return tuple(out)
-
-    def matmul(a, b):
-        a_is_poly = is_poly(a)
-        b_is_poly = is_poly(b)
-        if a_is_poly and not b_is_poly:
-            out = matmul_poly_tensor(a.coeffs, b)
-            if out is not None:
-                return out
-        if b_is_poly and not a_is_poly:
-            out = matmul_tensor_poly(a, b.coeffs)
-            if out is not None:
-                return out
-        return bilinear(torch.matmul, a, b)
-
-    def bmm_poly_tensor(A, b):
-        if A[0].dim() != 3 or b.dim() != 3:
-            return None
-        if any(c.dtype != b.dtype for c in A):
-            return None
-        batch, left, inner = A[0].shape
-        right = b.shape[-1]
-        A_stack = torch.stack(A).reshape((D + 1) * batch, left, inner)
-        b_stack = (
-            b.unsqueeze(0)
-            .expand(D + 1, *b.shape)
-            .reshape((D + 1) * batch, inner, right)
-        )
-        y = torch.bmm(A_stack, b_stack).reshape(D + 1, batch, left, right)
-        out = list(unstack_coeffs(y))
-        out[0] = torch.bmm(A[0], b)
-        return tuple(out)
-
-    def bmm_tensor_poly(a, B):
-        if a.dim() != 3 or B[0].dim() != 3:
-            return None
-        if any(c.dtype != a.dtype for c in B):
-            return None
-        batch, left, inner = a.shape
-        right = B[0].shape[-1]
-        a_stack = (
-            a.unsqueeze(0)
-            .expand(D + 1, *a.shape)
-            .reshape((D + 1) * batch, left, inner)
-        )
-        B_stack = torch.stack(B).reshape((D + 1) * batch, inner, right)
-        y = torch.bmm(a_stack, B_stack).reshape(D + 1, batch, left, right)
-        out = list(unstack_coeffs(y))
-        out[0] = torch.bmm(a, B[0])
-        return tuple(out)
-
-    def bmm(a, b):
-        a_is_poly = is_poly(a)
-        b_is_poly = is_poly(b)
-        if a_is_poly and not b_is_poly:
-            out = bmm_poly_tensor(a.coeffs, b)
-            if out is not None:
-                return out
-        if b_is_poly and not a_is_poly:
-            out = bmm_tensor_poly(a, b.coeffs)
-            if out is not None:
-                return out
-        return bilinear(torch.bmm, a, b)
 
     def bilinear(op, a, b):
         def apply(left, right):
@@ -352,66 +285,17 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         )
         return [native_loss, *out[1:]]
 
-    if func in (aten.add.Tensor, aten.add.Scalar):
-        a, b = args[:2]
-        alpha = kwargs.get("alpha", 1)
-        if is_poly(a) and not is_poly(b):
-            return wrap((a.coeffs[0] + alpha * b, *clone_coeffs(a.coeffs[1:])))
-        if not is_poly(a) and is_poly(b):
-            if alpha == 1:
-                return wrap((a + b.coeffs[0], *clone_coeffs(b.coeffs[1:])))
-            return wrap((a + alpha * b.coeffs[0], *(alpha * c for c in b.coeffs[1:])))
-        A, B = lift(a), lift(b)
-        return wrap(A[k] + alpha * B[k] for k in range(D + 1))
+    from ._range_ops import NOT_HANDLED, dispatch_range
 
-    if func in (aten.sub.Tensor, aten.sub.Scalar):
-        a, b = args[:2]
-        alpha = kwargs.get("alpha", 1)
-        if is_poly(a) and not is_poly(b):
-            return wrap((a.coeffs[0] - alpha * b, *clone_coeffs(a.coeffs[1:])))
-        if not is_poly(a) and is_poly(b):
-            return wrap((a - alpha * b.coeffs[0], *(-alpha * c for c in b.coeffs[1:])))
-        A, B = lift(a), lift(b)
-        return wrap(A[k] - alpha * B[k] for k in range(D + 1))
-
-    if func is aten.rsub.Scalar:
-        x, other = args[:2]
-        alpha = kwargs.get("alpha", 1)
-        return wrap((other - alpha * x.coeffs[0], *(-alpha * c for c in x.coeffs[1:])))
-
-    if func in (aten.mul.Tensor, aten.mul.Scalar):
-        a, b = args[:2]
-        if is_poly(a) and not is_poly(b):
-            return wrap(c * b for c in a.coeffs)
-        if not is_poly(a) and is_poly(b):
-            return wrap(a * c for c in b.coeffs)
-        return wrap(series.conv(lift(a), lift(b)))
-
-    if func in (aten.div.Tensor, aten.div.Scalar):
-        a, b = args[:2]
-        rounding_mode = kwargs.get("rounding_mode")
-        if rounding_mode is not None:
-            raise NotImplementedError("PolyTensor does not implement rounded division")
-        if is_poly(a) and not is_poly(b):
-            return wrap(c / b for c in a.coeffs)
-        return wrap(series.conv(lift(a), series.poly_reciprocal(lift(b))))
-
-    if func is aten.reciprocal.default:
-        return wrap(series.poly_reciprocal(lift(args[0])))
-
-    if func is aten.mm.default:
-        return wrap(matmul(args[0], args[1]))
-
-    if func in (aten.dot.default, aten.mv.default):
-        return wrap(bilinear(func, args[0], args[1]))
-
-    if func is aten.matmul.default:
-        return correct(wrap(matmul(args[0], args[1])))
-
-    if func is aten.bmm.default:
-        return correct(wrap(bmm(args[0], args[1])))
+    ranged = dispatch_range(func, args, kwargs, polys=polys, degree=D,
+                            wrap=wrap, correct=correct, preserve=preserve_saved_inputs)
+    if ranged is not NOT_HANDLED:
+        return ranged
 
     if func is aten.scaled_dot_product_attention.default:
+        from ._attention import attention
+        from ._range import attach_scaled
+
         query, key, value = args[:3]
         attn_mask = args[3] if len(args) > 3 else kwargs.get("attn_mask")
         dropout_p = args[4] if len(args) > 4 else kwargs.get("dropout_p", 0.0)
@@ -421,110 +305,51 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         if enable_gqa:
             raise NotImplementedError("PolyTensor does not implement GQA head repetition")
 
-        scale = (1.0 / math.sqrt(query.size(-1))) if scale is None else scale
-        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-        if is_causal:
-            causal_mask = torch.ones(
-                scores.shape[-2:],
-                dtype=torch.bool,
-                device=scores.device,
-            ).tril()
-            scores = scores.masked_fill(~causal_mask, float("-inf"))
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(~attn_mask, float("-inf"))
-            else:
-                scores = scores + attn_mask
-        attn_weight = torch.softmax(scores, dim=-1)
-        if dropout_p != 0.0:
-            attn_weight = torch.dropout(attn_weight, dropout_p, True)
-        return torch.matmul(attn_weight, value)
+        output, _, scaled, _ = attention(
+            lift(query), lift(key), lift(value),
+            attn_mask=None if attn_mask is None else lift(attn_mask),
+            dropout_p=dropout_p, is_causal=is_causal, scale=scale, _return_scaled=True,
+        )
+        return attach_scaled(wrap(output), scaled)
 
     if func is aten._scaled_dot_product_flash_attention_for_cpu.default:
+        from ._attention import attention
+        from ._range import attach_scaled
+
         query, key, value = args[:3]
         dropout_p = args[3] if len(args) > 3 else kwargs.get("dropout_p", 0.0)
         is_causal = args[4] if len(args) > 4 else kwargs.get("is_causal", False)
         attn_mask = kwargs.get("attn_mask")
         scale = kwargs.get("scale")
 
-        scale = (1.0 / math.sqrt(query.size(-1))) if scale is None else scale
-        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
-        if is_causal:
-            causal_mask = torch.ones(
-                scores.shape[-2:],
-                dtype=torch.bool,
-                device=scores.device,
-            ).tril()
-            scores = scores.masked_fill(~causal_mask, float("-inf"))
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(~attn_mask, float("-inf"))
-            else:
-                scores = scores + attn_mask
-        logsumexp = torch.logsumexp(scores, dim=-1)
-        attn_weight = torch.softmax(scores, dim=-1)
-        if dropout_p != 0.0:
-            attn_weight = torch.dropout(attn_weight, dropout_p, True)
-        return torch.matmul(attn_weight, value), logsumexp
+        if dropout_p != 0:
+            raise NotImplementedError("CPU flash attention requires dropout_p=0")
+        output, logsumexp, scaled, scaled_logsumexp = attention(
+            lift(query), lift(key), lift(value),
+            attn_mask=None if attn_mask is None else lift(attn_mask),
+            is_causal=is_causal, scale=scale, _return_scaled=True,
+        )
+        return attach_scaled(wrap(output), scaled), attach_scaled(wrap(logsumexp), scaled_logsumexp)
 
-    if func is aten.addmm.default:
-        x, a, b = args[:3]
-        beta = kwargs.get("beta", 1)
-        alpha = kwargs.get("alpha", 1)
-        M = matmul(a, b)
-        if beta == 0:
-            return wrap(alpha * m for m in M)
-        if is_poly(x):
-            X = x.coeffs
-            return wrap(beta * X[k] + alpha * M[k] for k in range(D + 1))
-        out = [alpha * m for m in M]
-        out[0] = beta * x + out[0]
-        return wrap(out)
+    if func is aten._scaled_dot_product_flash_attention_for_cpu_backward.default:
+        from ._attention import attention_backward
+        from ._range import attach_scaled, get_scaled
 
-    if func is aten.linear.default:
-        x, weight = args[:2]
-        bias = args[2] if len(args) > 2 else kwargs.get("bias")
-        if is_poly(weight):
-            if is_poly(x):
-                Y = bilinear(
-                    lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
-                    x,
-                    weight,
-                )
-            else:
-                weight_t = tuple(w.transpose(-2, -1) for w in weight.coeffs)
-                Y = matmul_tensor_poly(x, weight_t)
-                if Y is None:
-                    Y = bilinear(
-                        lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
-                        x,
-                        weight,
-                    )
-        elif is_poly(x):
-            Y = matmul_poly_tensor(
-                x.coeffs,
-                weight.transpose(-2, -1),
-            )
-            if Y is None:
-                Y = bilinear(
-                    lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
-                    x,
-                    weight,
-                )
-        else:
-            Y = bilinear(
-                lambda a, b: torch.matmul(a, b.transpose(-2, -1)),
-                x,
-                weight,
-            )
-        if bias is not None:
-            if is_poly(bias):
-                B = bias.coeffs
-                Y = [Y[k] + B[k] for k in range(D + 1)]
-            else:
-                Y = list(Y)
-                Y[0] = Y[0] + bias
-        return wrap(Y)
+        grad_output, query, key, value = args[:4]
+        dropout_p = args[6] if len(args) > 6 else kwargs.get("dropout_p", 0.0)
+        is_causal = args[7] if len(args) > 7 else kwargs.get("is_causal", False)
+        attn_mask = kwargs.get("attn_mask")
+        if dropout_p != 0:
+            raise NotImplementedError("CPU flash attention backward requires dropout_p=0")
+        gradients = attention_backward(
+            get_scaled(grad_output) or lift(grad_output), lift(query), lift(key), lift(value),
+            attn_mask=None if attn_mask is None else lift(attn_mask),
+            is_causal=is_causal, scale=kwargs.get("scale"), _return_scaled=True,
+        )
+        return tuple(
+            attach_scaled(wrap(c.to_tensor(coefficient_dtype(c.mantissa, source.dtype)) for c in gradient), gradient)
+            for gradient, source in zip(gradients, (query, key, value))
+        )
 
     if func in (aten.convolution.default, aten.conv2d.default):
         x, weight, bias = args[:3]
@@ -538,10 +363,6 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             ]
         return wrap(Y)
 
-    if func is aten.neg.default:
-        A = lift(args[0])
-        return wrap(-A[k] for k in range(D + 1))
-
     if func is aten.pow.Tensor_Scalar:
         x, n = args[:2]
         if isinstance(n, float) and n.is_integer():
@@ -554,91 +375,11 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             y = y * x
         return y
 
-    if func in (aten.add_.Tensor, aten.add_.Scalar):
-        a, b = args[:2]
-        alpha = kwargs.get("alpha", 1)
-        if not is_poly(b):
-            a.coeffs[0].add_(b, alpha=alpha)
-            return a
-        A, B = lift(a), lift(b)
-        check_coefficient_storage(A, B)
-        for k in range(D + 1):
-            A[k].add_(B[k], alpha=alpha)
-        return a
-
-    if func in (aten.sub_.Tensor, aten.sub_.Scalar):
-        a, b = args[:2]
-        alpha = kwargs.get("alpha", 1)
-        if not is_poly(b):
-            a.coeffs[0].sub_(b, alpha=alpha)
-            return a
-        A, B = lift(a), lift(b)
-        check_coefficient_storage(A, B)
-        for k in range(D + 1):
-            A[k].sub_(B[k], alpha=alpha)
-        return a
-
-    if func in (aten.mul_.Tensor, aten.mul_.Scalar):
-        a, b = args[:2]
-        if not is_poly(b):
-            for coeff in a.coeffs:
-                coeff.mul_(b)
-            return a
-        out = series.conv(lift(a), lift(b))
-        copy_coefficients(a.coeffs, out)
-        return a
-
-    if func in (aten.div_.Tensor, aten.div_.Scalar):
-        a, b = args[:2]
-        rounding_mode = kwargs.get("rounding_mode")
-        if rounding_mode is not None:
-            raise NotImplementedError("PolyTensor does not implement rounded in-place division")
-        if not is_poly(b):
-            for coeff in a.coeffs:
-                coeff.div_(b)
-            return a
-        out = series.conv(lift(a), series.poly_reciprocal(lift(b)))
-        copy_coefficients(a.coeffs, out)
-        return a
-
-    if func in (aten.masked_fill.Scalar, aten.masked_fill.Tensor):
-        x, mask, value = args[:3]
-        X = lift(x)
-        if is_poly(value):
-            V = lift(value)
-            return wrap(torch.where(plain(mask), V[k], X[k]) for k in range(D + 1))
-        return wrap(
-            (
-                X[0].masked_fill(plain(mask), value),
-                *(c.masked_fill(plain(mask), 0) for c in X[1:]),
-            )
-        )
-
-    if func in (aten.masked_fill_.Scalar, aten.masked_fill_.Tensor):
-        x, mask, value = args[:3]
-        if is_poly(value):
-            X, V = lift(x), lift(value)
-            copy_coefficients(X, (torch.where(plain(mask), V[k], X[k]) for k in range(D + 1)))
-            return x
-        x.coeffs[0].masked_fill_(plain(mask), value)
-        for coeff in x.coeffs[1:]:
-            coeff.masked_fill_(plain(mask), 0)
-        return x
-
-    if func in (
-        aten.where.self,
-        aten.where.ScalarOther,
-        aten.where.ScalarSelf,
-        aten.where.Scalar,
-    ):
-        condition = plain(args[0])
-        a = args[1]
-        b = args[2]
-        A, B = lift(a), lift(b)
-        return wrap(torch.where(condition, A[k], B[k]) for k in range(D + 1))
-
     if func is aten.exp.default:
-        return wrap(series.poly_exp(lift(args[0])))
+        from ._range import attach_scaled
+
+        coefficients = lift(args[0])
+        return attach_scaled(wrap(series.poly_exp(coefficients)), series._poly_exp_scaled(coefficients))
 
     if func is aten.sin.default:
         return wrap(series.poly_sin(lift(args[0])))
@@ -662,75 +403,79 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         return wrap(series.poly_logsumexp(lift(x), dim, keepdim))
 
     if func is aten.sigmoid.default:
-        return wrap(series.poly_sigmoid(lift(args[0])))
+        return wrap_activation(lift(args[0]), "sigmoid")
 
     if func is aten.tanh.default:
-        return wrap(series.poly_tanh(lift(args[0]))[0])
+        return wrap_activation(lift(args[0]), "tanh")
 
     if func is aten.silu.default:
-        X = lift(args[0])
-        S = series.poly_sigmoid(X)
-        out = [torch.nn.functional.silu(X[0])]
-        for k in range(1, D + 1):
-            coefficient = X[0] * S[k]
-            for i in range(1, k + 1):
-                coefficient = coefficient + X[i] * S[k - i]
-            out.append(coefficient)
-        return wrap(out)
+        return wrap_activation(lift(args[0]), "silu")
 
     if func is aten.gelu.default:
         approximate = args[1] if len(args) > 1 else kwargs.get("approximate", "none")
-        out = series.poly_gelu(lift(args[0]), approximate)
-        out[0] = torch.nn.functional.gelu(lift(args[0])[0], approximate=approximate)
-        return wrap(out)
+        if approximate not in ("none", "tanh"):
+            raise ValueError("GELU approximate must be 'none' or 'tanh'")
+        return wrap_activation(lift(args[0]), "gelu" if approximate == "none" else "gelu_tanh")
 
     if func is aten._log_softmax.default:
         dim = args[1] if len(args) > 1 else kwargs["dim"]
         half_to_float = args[2] if len(args) > 2 else kwargs.get("half_to_float", False)
         coefficients = lift(args[0])
         if half_to_float:
-            coefficients = [c.float() for c in coefficients]
-        return wrap(series.poly_log_softmax(coefficients, dim))
+            coefficients = [c.to(dtype=coefficient_dtype(c, torch.float32)) for c in coefficients]
+        return wrap_normalization(coefficients, dim, log=True)
 
     if func is aten.log_softmax.int:
         dim = args[1] if len(args) > 1 else kwargs["dim"]
         dtype = args[2] if len(args) > 2 else kwargs.get("dtype")
+        coefficients = lift(args[0])
         if dtype is not None:
-            out = series.poly_log_softmax([c.to(dtype=dtype) for c in lift(args[0])], dim)
-        else:
-            out = series.poly_log_softmax(lift(args[0]), dim)
-        return wrap(out)
+            coefficients = [c.to(dtype=coefficient_dtype(c, dtype)) for c in coefficients]
+        return wrap_normalization(coefficients, dim, log=True)
+
+    if func is getattr(getattr(aten, "_safe_softmax", None), "default", None):
+        from ._attention import _safe_scores, safe_softmax
+
+        dim = args[1] if len(args) > 1 else kwargs["dim"]
+        dtype = args[2] if len(args) > 2 else kwargs.get("dtype")
+        coefficients = tuple(
+            c.to(dtype=coefficient_dtype(c, dtype)) if dtype is not None else c
+            for c in lift(args[0])
+        )
+        probabilities, _ = safe_softmax(coefficients, dim)
+        output = wrap(probabilities)
+        safe, excluded, _ = _safe_scores(coefficients, dim)
+        from ._normalization import normalization_scaled_series
+        from ._range import attach_scaled
+
+        scaled, _ = normalization_scaled_series(safe, dim)
+        attach_scaled(output, (c.masked_fill(excluded, 0) for c in scaled))
+        output._normalization_input_coeffs = safe
+        output._normalization_dim = dim
+        output._normalization_excluded = excluded
+        return output
 
     if func is aten._softmax.default:
         dim = args[1] if len(args) > 1 else kwargs["dim"]
         half_to_float = args[2] if len(args) > 2 else kwargs.get("half_to_float", False)
+        coefficients = lift(args[0])
         if half_to_float:
-            return wrap(series.poly_softmax([c.float() for c in lift(args[0])], dim))
-        return wrap(series.poly_softmax(lift(args[0]), dim))
+            coefficients = [c.to(dtype=coefficient_dtype(c, torch.float32)) for c in coefficients]
+        return wrap_normalization(coefficients, dim)
 
     if func is aten.softmax.int:
         dim = args[1] if len(args) > 1 else kwargs["dim"]
         dtype = args[2] if len(args) > 2 else kwargs.get("dtype")
+        coefficients = lift(args[0])
         if dtype is not None:
-            out = series.poly_softmax([c.to(dtype=dtype) for c in lift(args[0])], dim)
-        else:
-            out = series.poly_softmax(lift(args[0]), dim)
-        return wrap(out)
+            coefficients = [c.to(dtype=coefficient_dtype(c, dtype)) for c in coefficients]
+        return wrap_normalization(coefficients, dim)
 
     if func is aten.embedding.default:
         weight = args[0]
         return wrap(func(w, *plain(args[1:]), **plain(kwargs)) for w in lift(weight))
 
     if func is aten.avg_pool2d.default:
-        return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
-
-    if func in (aten.mean.default, aten.mean.dim):
-        return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
-
-    if func in (aten.sum.default, aten.sum.dim_IntList):
-        return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
-
-    if func in (aten.sum_to_size.default, aten._grad_sum_to_size.default):
         return wrap(func(c, *args[1:], **kwargs) for c in lift(args[0]))
 
     if func is aten.nll_loss_forward.default:
@@ -763,6 +508,13 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
     if func is aten._log_softmax_backward_data.default:
         grad_output, output, dim = args[:3]
         input_dtype = args[3] if len(args) > 3 else kwargs.get("input_dtype")
+        if hasattr(output, "_normalization_input_coeffs"):
+            from ._normalization import normalization_backward
+            from ._range import attach_scaled, get_scaled
+
+            gradients = get_scaled(grad_output) or lift(grad_output)
+            values = normalization_backward(gradients, output._normalization_input_coeffs, dim, log=True, _return_scaled=True)
+            return attach_scaled(wrap(c.to_tensor(coefficient_dtype(c.mantissa, input_dtype)) for c in values), values)
         G = lift(grad_output)
         O = lift(output)
 
@@ -775,46 +527,59 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             for i in range(1, k + 1):
                 s = s + E[i] * S[k - i]
             y = G[k] - s
-            out.append(y.to(dtype=input_dtype) if input_dtype is not None else y)
+            out.append(y.to(dtype=coefficient_dtype(y, input_dtype)) if input_dtype is not None else y)
 
         return wrap(out)
 
     if func is aten._softmax_backward_data.default:
         grad_output, output, dim = args[:3]
         input_dtype = args[3] if len(args) > 3 else kwargs.get("input_dtype")
+        if hasattr(output, "_normalization_input_coeffs"):
+            from ._normalization import normalization_backward
+            from ._range import attach_scaled, get_scaled
+
+            gradients = get_scaled(grad_output) or lift(grad_output)
+            excluded = getattr(output, "_normalization_excluded", None)
+            if excluded is not None:
+                gradients = tuple(c.masked_fill(excluded, 0) for c in gradients)
+            values = normalization_backward(gradients, output._normalization_input_coeffs, dim, _return_scaled=True)
+            if excluded is not None:
+                values = [c.masked_fill(excluded, 0) for c in values]
+            return attach_scaled(wrap(c.to_tensor(coefficient_dtype(c.mantissa, input_dtype)) for c in values), values)
         G = lift(grad_output)
         O = lift(output)
         GO = series.conv(G, O)
         S = [go.sum(dim=dim, keepdim=True) for go in GO]
         out = series.conv(O, [G[k] - S[k] for k in range(D + 1)])
-        return wrap(y.to(dtype=input_dtype) if input_dtype is not None else y for y in out)
+        return wrap(y.to(dtype=coefficient_dtype(y, input_dtype)) if input_dtype is not None else y for y in out)
 
     if func is aten.sigmoid_backward.default:
         G = lift(args[0])
+        if hasattr(args[1], "_activation_input_coeffs"):
+            return wrap_activation_backward(args[1]._activation_input_coeffs, args[0], "sigmoid")
         O = lift(args[1])
         one_minus_o = [1 - O[0]] + [-O[k] for k in range(1, D + 1)]
         return wrap(series.conv(G, series.conv(O, one_minus_o)))
 
     if func is aten.tanh_backward.default:
         G = lift(args[0])
+        if hasattr(args[1], "_activation_input_coeffs"):
+            return wrap_activation_backward(args[1]._activation_input_coeffs, args[0], "tanh")
         O = lift(args[1])
         O2 = series.conv(O, O)
         one_minus_o2 = [1 - O2[0]] + [-O2[k] for k in range(1, D + 1)]
         return wrap(series.conv(G, one_minus_o2))
 
     if func is aten.silu_backward.default:
-        G = lift(args[0])
-        X = lift(args[1])
-        S = series.poly_sigmoid(X)
-        one_minus_s = [1 - S[0]] + [-S[k] for k in range(1, D + 1)]
-        x_s_one_minus_s = series.conv(X, series.conv(S, one_minus_s))
-        derivative = [S[k] + x_s_one_minus_s[k] for k in range(D + 1)]
-        return wrap(series.conv(G, derivative))
+        return wrap_activation_backward(lift(args[1]), args[0], "silu")
 
     if func is aten.gelu_backward.default:
         grad_output, x = args[:2]
         approximate = args[2] if len(args) > 2 else kwargs.get("approximate", "none")
-        return wrap(series.conv(lift(grad_output), series.poly_gelu_grad(lift(x), approximate)))
+        if approximate not in ("none", "tanh"):
+            raise ValueError("GELU approximate must be 'none' or 'tanh'")
+        kind = "gelu" if approximate == "none" else "gelu_tanh"
+        return wrap_activation_backward(lift(x), grad_output, kind)
 
     if func is aten.isnan.default:
         out = torch.isnan(lift(args[0])[0])
@@ -966,16 +731,10 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
     if func is aten.new_empty_strided.default:
         return wrap(func(c, *args[1:], **coefficient_options(c, kwargs)) for c in lift(args[0]))
 
-    if func is aten.detach.default:
-        return PolyTensor(tuple(c.detach() for c in lift(args[0])))
-
     if func is aten.detach_.default:
         x = args[0]
         x._set_coeffs(c.detach() for c in lift(x))
         return x
-
-    if func is aten.alias.default:
-        return correct(PolyTensor(tuple(func(c) for c in lift(args[0]))))
 
     if func in (
         aten._conj.default,
@@ -987,10 +746,6 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         aten.view_as_complex.default,
     ):
         return correct(wrap(func(c, *args[1:], **kwargs) for c in lift(args[0])))
-
-    if func is aten.clone.default:
-        x = args[0]
-        return PolyTensor(tuple(c.clone(**kwargs) for c in lift(x)), requires_grad=x.requires_grad)
 
     if func in (
         aten._to_copy.default,
@@ -1019,13 +774,20 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
                 )
             return func(c, *other_args, **options)
 
-        return wrap(convert(c) for c in lift(args[0]))
+        from ._range import attach_scaled, get_scaled
+        from ._scaled import ScaledTensor
 
-    if func is aten.zero_.default:
-        x = args[0]
-        for coeff in lift(x):
-            coeff.zero_()
-        return x
+        result = wrap(convert(c) for c in lift(args[0]))
+        scaled = get_scaled(args[0])
+        if scaled is not None:
+            def convert_scaled(value, target):
+                if value.mantissa.is_complex():
+                    return ScaledTensor._from_parts(convert_scaled(value.real, target.real),
+                                                    convert_scaled(value.imag, target.real))
+                return ScaledTensor(value.mantissa.to(device=target.device, dtype=target.dtype),
+                                    value.exponent.to(device=target.device))
+            attach_scaled(result, (convert_scaled(c, target) for c, target in zip(scaled, result.coeffs)))
+        return result
 
     if func in (aten.bernoulli_.float, aten.bernoulli_.Tensor):
         x = args[0]
@@ -1034,57 +796,7 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             coeff.zero_()
         return x
 
-    if func is aten.copy_.default:
-        x, src = args[:2]
-        X, S = lift(x), lift(src)
-        non_blocking = args[2] if len(args) > 2 else kwargs.get("non_blocking", False)
-        copy_coefficients(X, S, non_blocking=non_blocking)
-        return x
-
-    if func in (
-        aten.t.default,
-        aten.transpose.int,
-        aten.permute.default,
-        aten.view.default,
-        aten.reshape.default,
-        aten._unsafe_view.default,
-        aten.flatten.using_ints,
-        aten.as_strided.default,
-        aten.slice.Tensor,
-        aten.select.int,
-        aten.unsqueeze.default,
-        aten.squeeze.dim,
-        aten.squeeze.default,
-    ):
+    if func is aten.as_strided.default:
         return correct(wrap(func(c, *args[1:], **kwargs) for c in lift(args[0])))
-
-    if func is aten.expand.default:
-        x, size = args[:2]
-        return correct(wrap(c.expand(size) for c in lift(x)))
-
-    if func is aten.cat.default:
-        tensors = args[0]
-        dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
-        return wrap(
-            torch.cat([lift(tensor)[k] for tensor in tensors], dim=dim)
-            for k in range(D + 1)
-        )
-
-    if func is aten.stack.default:
-        tensors = args[0]
-        dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
-        return wrap(
-            torch.stack([lift(tensor)[k] for tensor in tensors], dim=dim)
-            for k in range(D + 1)
-        )
-
-    if func is aten.index_select.default:
-        return wrap(func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0]))
-
-    if func is aten.gather.default:
-        return wrap(func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0]))
-
-    if func is aten.index.Tensor:
-        return wrap(func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0]))
 
     raise NotImplementedError(f"PolyTensor does not implement {func}")

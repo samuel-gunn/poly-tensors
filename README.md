@@ -6,7 +6,7 @@ Warning: All code is written by AI.
 `PolyTensor((x, v), degree=n)` represents `x + t*v`, keeping powers of the scalar
 `t` through order `n`. For a supported smooth function `f`, `f(...).coeffs[k]`
 is the `k`th-order Taylor coefficient (i.e., the directional derivative divided by `k!`), and `.value` is the constant term.
-Directions may be complex. Operations with PolyTensors of different orders upgrades the output to the maximum input order.
+Directions may be complex.
 
 Install from this checkout: `pip install .`. The planned PyPI command is
 `pip install polytensors`; the package has not been published yet.

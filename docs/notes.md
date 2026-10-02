@@ -1,9 +1,9 @@
 # PolyTensors implementation and numerical notes
 
 This is an early package, not a drop-in replacement for arbitrary PyTorch
-programs. The library is separated into `_tensor.py` (datatype and autograd
-contexts), `_dispatch.py` (PyTorch operator rules), and `_series.py` (coefficient
-arithmetic). Only `PolyTensor` is public.
+programs. `_tensor.py` defines the datatype and autograd contexts;
+`_dispatch.py` supplies PyTorch operator rules. Private modules implement series
+arithmetic, activations, normalization, and attention. Only `PolyTensor` is public.
 
 ## What is implemented
 
@@ -16,8 +16,10 @@ operations; their presence is not a claim of complete forward/backward coverage.
 An unsupported dispatched operation raises `NotImplementedError`.
 
 There is no hard-coded maximum order. Each result contains `degree + 1` tensors.
-A polynomial product generally needs O(degree²) tensor operations. Increasing
-tensor size and derivative order increases both memory and computation.
+A polynomial product generally needs O(degree²) tensor operations; the current
+activation composition can require O(degree³). Increasing tensor size and
+derivative order increases both memory and computation. Stable activation
+evaluation also uses wider internal mantissas where the device supports them.
 
 ## Not implemented or not established
 
@@ -32,10 +34,9 @@ tensor size and derivative order increases both memory and computation.
   fractional powers, linear solves/determinants, native layer/batch normalization,
   and several indexing backward operations (`scatter_add`, `index_add`, and
   related updates). Forward support does not imply backward support.
-- General fused attention support. The inherited CPU attention decomposition
-  has no corresponding fused backward rule. Fully masked rows can produce NaNs
-  because it uses ordinary softmax on an all-negative-infinity row. Prefer an
-  explicitly implemented, tested attention calculation; this is a known bug.
+- General fused attention support. PyTorch's math attention path and CPU flash
+  attention forward/backward are tested. CUDA fused attention and grouped-query
+  attention are not established. CPU flash backward requires zero dropout.
 - General loss options. The direct cross-entropy rule rejects soft targets,
   label smoothing, and polynomial class weights/targets. PyTorch may decompose a
   public loss differently across releases; no complete loss-option compatibility
@@ -103,9 +104,63 @@ interchangeable with complex directions through a real training computation.
   `exp(x - logsumexp(x))` can sum to two instead of one for two equal logits
   near `1e20`, corrupting even the first derivative.
 
+## Numerical stability changes
+
+- Exact and tanh-approximate GELU evaluate derivative terms with a separate
+  binary exponent. Gaussian factors therefore do not round to zero before
+  multiplication by large directions. Extreme inputs are replaced by their
+  limiting linear/constant behavior only after a bound involving the degree,
+  direction magnitudes, and dtype establishes that the requested tail cannot
+  be represented. Unsafe intermediate squares/cubes are avoided.
+- Sigmoid, tanh, and SiLU derivatives use the input and the decaying exponential
+  tail, rather than a rounded output such as `sigmoid(x) == 1`. This preserves
+  representable higher coefficients in saturated regions. Their backward
+  rules and GELU's multiply incoming gradients before rounding tiny derivatives.
+- Exponential and square-root series keep intermediate products scaled, avoiding
+  premature underflow and overflow. For example, float64
+  `exp(-1000 + 1e150*t)` has a zero stored constant but nonzero first and second
+  coefficients.
+- Softmax, log-softmax, and logsumexp remove common offsets from higher input
+  coefficients and retain tiny probabilities in scaled form during coefficient
+  calculations. Analytic coefficient-autograd rules preserve these properties
+  in backward. Softmax/log-softmax wrapper backward also saves the input series
+  instead of reconstructing derivatives from rounded probabilities.
+- Attention excludes masked entries before normalization. Fully masked rows
+  produce zero output coefficients and zero gradients; their CPU flash
+  auxiliary log-normalizer is zero, following PyTorch's convention. Both Boolean
+  masks and additive negative-infinity masks are covered. An ordinary unmasked
+  softmax of all negative infinities remains undefined.
+- Attention applies its scale before the query/key product to avoid overflowing
+  an unscaled score. Half/bfloat16 inputs use float32 internal accumulation.
+  Complex higher coefficients retain their imaginary parts in dtype conversions.
+- Wrapper autograd for exp and single-axis logsumexp now saves the input and
+  uses explicit backward rules. These run above PyTorch's native autograd layer;
+  changing the forward dispatch rule alone could not repair its saved-output
+  formulas. Equal float32 logits near `1e20` now give logsumexp gradients
+  `[0.5, 0.5]`, and large incoming gradients can recover underflowed exp tails.
+  First, second, and third reverse derivatives are tested.
+- Extended-range coefficients now survive supported operator boundaries.
+  Arithmetic, matrix products, sums/means, ordinary shape/index operations,
+  clones, detaches, and dtype conversions carry private binary scales.
+  Exp, activations, softmax/log-softmax, and attention provide those scales.
+  Thus `exp(-1000) * 1e300` and attention with scores `[0, -1000]` and values
+  `[0, 1e300]` recover contributions near `5.076e-135` in float64.
+  Attention's value and score gradients also keep products scaled, including
+  cases where the incoming gradient times a value exceeds the dtype's range.
+- Scaled matrix products use the native matrix kernel when the exponent range
+  is safe and bounded blocks of scaled products otherwise. The slower path
+  avoids a full query-by-key-by-value temporary tensor. Retaining scales adds
+  memory and arithmetic overhead; large-workload performance is not established.
+- Native conjugate/negative view handling and coefficient version counters are
+  enabled within dispatch. Complex backward values are interpreted correctly,
+  and writes through aliases invalidate cached scales. In-place arithmetic
+  computes from the saved scales and updates the destination's scale cache.
+
 Native constant coefficients are retained where supplied by an existing native
-kernel. Higher coefficients need not match the exact rounding order of PyTorch's
-native backward formulas; the tests check numerical correctness instead.
+kernel, but later scaled arithmetic can recover information that an ordinary
+tensor operation already rounded away. Results therefore need not match native
+PyTorch's rounding order, including at coefficient zero; the tests check
+numerical correctness instead.
 
 ## Remaining sources of infinity and NaN
 
@@ -115,18 +170,33 @@ native backward formulas; the tests check numerical correctness instead.
    unstable update dynamics can therefore create enormous coefficients even
    when parameter values stay finite. No finite floating-point dtype prevents
    this in general.
-2. **Avoidable intermediate overflow remains in GELU.** With float32
-   `x(t)=1e20 + 1e20*t`, degree 3, exact GELU produces NaNs in higher orders and
-   its tanh approximation fails earlier. Squaring/cubing the input overflows,
-   then saturated exponential/tanh terms produce `0 * inf`. This is a confirmed
-   implementation issue; it has not been fixed by the recurrence changes above.
-3. **Domain boundaries and masks.** Reciprocal at zero, square root at zero,
-   logarithms outside their real domain, and all-masked softmax rows can have
-   undefined or singular derivatives. Sqrt's recurrence divides by the base
-   square root. No clipping or replacement of nonfinite coefficients is applied.
+2. **Boundaries of extended-range storage.** Public `.value` and `.coeffs`
+   tensors still have their declared dtype's finite range. Using those ordinary
+   tensors in subsequent computations, or constructing a new PolyTensor from
+   them, loses the private scales. Rules without scale propagation, including
+   convolution and storage-based `as_strided`, also form rounding boundaries.
+   Nonlinear rules generally consume ordinary input coefficients; this does not
+   enable expressions such as `sin(exp(1000))` to evaluate an out-of-range
+   argument. Manual coefficient writes invalidate the scales; inference-mode
+   tensors do not retain them because PyTorch disables mutation version counters.
+   Other inherited native backward formulas have not all been audited.
+   Ordinary coefficient autograd also still has finite-range internal adjoints:
+   for float64 `a = b = 1e300`, the coefficient-mode calculation
+   `a*b - b*b` has a recovered zero value but can give an infinite gradient with
+   respect to `a`, although the mathematical gradient is `1e300`. Its backward
+   graph would need to carry scaled gradients through every intermediate, not
+   just the analytic boundaries implemented here. Wrapper autograd and
+   coefficient autograd therefore have different numerical limits.
+3. **Domain boundaries and invalid inputs.** Reciprocal at zero, square root at
+   zero, and logarithms outside their real domain have undefined or singular
+   derivatives. Sqrt's recurrence divides by the base square root. Unmasked NaNs
+   and positive infinities are not repaired. There is no blanket clipping or
+   replacement of nonfinite coefficients.
 4. **Rounding and cancellation.** Low precision, many reductions, and subtracting
    similar coefficient values lose accuracy. float64/complex128 offer more
-   precision and range but cannot cure an ill-conditioned computation.
+   precision and range but cannot cure an ill-conditioned computation. Scaled
+   arithmetic extends exponent range, not mantissa precision, and does not
+   guarantee stability through an arbitrary number of reverse passes.
 5. **Converting coefficients to derivatives.** Multiplication by `k!` may
    overflow even when the stored coefficient is finite. Keep coefficient form
    when the calculation does not need raw derivatives.
@@ -137,7 +207,8 @@ native backward formulas; the tests check numerical correctness instead.
    ordinary autograd graphs as requested by the caller.
 
 To locate a failure, inspect `torch.isfinite(c).all()` for each ordinary tensor
-in `.coeffs` after successive operations or updates. Compare degree zero with an
+in `.coeffs` after successive operations or updates; a nonfinite materialized
+coefficient can still have a recoverable private scale. Compare degree zero with an
 ordinary run using the same data and randomness, and check small-order results
 against an independent derivative calculation. Scaling the direction by a
 nonzero factor `s` scales coefficient `k` by `s**k` for a line input; this can
@@ -149,6 +220,8 @@ No automatic direction normalization or rescaling is performed.
 Run `pip install -e '.[test]'` followed by `python -m pytest`. Tests compare
 coefficients with analytic formulas, ordinary PyTorch higher derivatives, and
 independent functional training calculations. They include float32 overflow
-regressions, degree-12 series, complex directions, and real/complex scalar and
-small-module SGD. The README example and wheel/source-archive builds were also
-checked. These small tests do not establish stability for long or large runs.
+regressions in float32/float64, degree-12 series, saturated activation tails,
+fully masked attention, complex directions, coefficient gradients and second
+reverse derivatives, and real/complex scalar and small-module SGD. The README
+example and wheel/source-archive builds were also checked. These small tests do
+not establish stability for long or large runs or on untested devices.

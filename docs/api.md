@@ -42,6 +42,14 @@ with another order are copied to keep orders independently mutable. Mutating
 `.coeffs` manually, or replacing coefficients with different shapes/devices,
 bypasses the wrapper's metadata and is unsupported.
 
+Some operators also retain private binary scales between operations. An ordinary
+`.value` or `.coeffs[k]` can therefore round to zero or infinity while subsequent
+PolyTensor arithmetic recovers a finite result. For a float64 PolyTensor `x`
+with value `-1000`, `torch.exp(x) * 1e300` retains the tiny exponential until
+after multiplication. Calculating with the extracted ordinary coefficient loses
+that extra range. This extends exponent range, not floating-point precision;
+see [numerical notes](notes.md) for supported paths and boundaries.
+
 ## Reverse differentiation inside a forward calculation
 
 For supported reverse-mode operations, construct polynomial parameters with

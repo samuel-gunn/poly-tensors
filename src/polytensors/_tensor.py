@@ -224,7 +224,23 @@ class PolyTensor(torch.Tensor):
             return f"PolyTensor(<uninitialized>, requires_grad={self.requires_grad})"
         return f"PolyTensor({self.coeffs}, requires_grad={self.requires_grad})"
 
-    __torch_function__ = torch._C._disabled_torch_function_impl
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = {} if kwargs is None else kwargs
+        # These native autograd formulas recover derivatives from rounded
+        # outputs. Intercept above Autograd so backward can instead use the
+        # original input, including for subsequent reverse derivatives.
+        if not _coefficient_autograd_enabled.get() and torch.is_grad_enabled():
+            from ._wrapper_autograd import maybe_apply
+
+            result = maybe_apply(func, args, kwargs)
+            if result is not NotImplemented:
+                return result
+        # Keep the established dispatch behavior for all other operations.
+        # In particular, do not apply Tensor's default subclass conversion to
+        # ordinary coefficient tensors returned by properties or containers.
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
@@ -237,6 +253,9 @@ class PolyTensor(torch.Tensor):
             # asynchronous callers.
             with contextlib.ExitStack() as stack:
                 for key in (
+                    torch._C.DispatchKey.Conjugate,
+                    torch._C.DispatchKey.Negative,
+                    torch._C.DispatchKey.ADInplaceOrView,
                     torch._C.DispatchKey.Autograd,
                     torch._C.DispatchKey.AutogradFunctionality,
                     torch._C.DispatchKey.AutogradOther,
@@ -254,10 +273,21 @@ class PolyTensor(torch.Tensor):
                     coefficient_autograd=True,
                 )
 
-        return dispatch(
-            func,
-            types,
-            args,
-            kwargs,
-            coefficient_autograd=False,
-        )
+        # Coefficients can have conjugate/negative view bits independently of
+        # the wrapper. Restore their value semantics and native view version
+        # counters while operating below the wrapper's Autograd key. Shared
+        # version counters also invalidate hidden ranges on writes via aliases.
+        with contextlib.ExitStack() as stack:
+            for key in (
+                torch._C.DispatchKey.Conjugate,
+                torch._C.DispatchKey.Negative,
+                torch._C.DispatchKey.ADInplaceOrView,
+            ):
+                stack.enter_context(torch._C._SetExcludeDispatchKeyGuard(key, False))
+            return dispatch(
+                func,
+                types,
+                args,
+                kwargs,
+                coefficient_autograd=False,
+            )

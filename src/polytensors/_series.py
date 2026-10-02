@@ -4,6 +4,8 @@ import math
 
 import torch
 
+from ._scaled import ScaledTensor
+
 
 class SeriesOps:
     def __init__(self, degree):
@@ -19,15 +21,24 @@ class SeriesOps:
         return out
 
     def poly_exp(self, X):
-        Y = [None] * (self.degree + 1)
-        Y[0] = torch.exp(X[0])
+        if torch.is_grad_enabled() and any(x.requires_grad for x in X):
+            from ._exponential import exponential_series
 
+            return exponential_series(X)
+        Y = self._poly_exp_scaled(X)
+        return [torch.exp(X[0]), *(y.to_tensor(dtype=X[-1].dtype) for y in Y[1:])]
+
+    def _poly_exp_scaled(self, X):
+        # Retain the exponential's exponent while generating coefficients.
+        # exp(x0) may underflow even though exp(x0) * direction**k / k!
+        # is representable, so a rounded coefficient zero cannot seed this
+        # recurrence.
+        Y = [ScaledTensor.from_log(X[0])]
         for k in range(1, self.degree + 1):
-            s = (X[1] / k) * Y[k - 1]
+            s = (ScaledTensor.from_tensor(X[1]) / k) * Y[k - 1]
             for i in range(2, k + 1):
-                s = s + ((i / k) * X[i]) * Y[k - i]
-            Y[k] = s
-
+                s = s + (ScaledTensor.from_tensor(X[i]) * (i / k)) * Y[k - i]
+            Y.append(s)
         return Y
 
     def poly_log(self, X):
@@ -59,16 +70,15 @@ class SeriesOps:
         return Y
 
     def poly_sqrt(self, X):
-        Y = [None] * (self.degree + 1)
-        Y[0] = torch.sqrt(X[0])
-
+        value = torch.sqrt(X[0])
+        Y = [ScaledTensor.from_tensor(value)]
+        denominator = 2 * Y[0]
         for k in range(1, self.degree + 1):
-            s = torch.zeros_like(X[0])
+            residual = ScaledTensor.from_tensor(X[k])
             for i in range(1, k):
-                s = s + Y[i] * Y[k - i]
-            Y[k] = (X[k] - s) / (2 * Y[0])
-
-        return Y
+                residual = residual - Y[i] * Y[k - i]
+            Y.append(residual / denominator)
+        return [value, *(y.to_tensor(dtype=X[-1].dtype) for y in Y[1:])]
 
     def poly_rsqrt(self, X):
         Y = [None] * (self.degree + 1)
@@ -112,63 +122,103 @@ class SeriesOps:
         *,
         probability_zero,
         logsumexp_zero,
+        log_probability_zero=None,
+        _return_scaled=False,
     ):
         """Generate normalized-exponential and normalizer coefficients.
 
-        Higher coefficients are generated from
+        Remove a common shift from every input coefficient. Choose the
+        coefficient at the largest base logit as that shift: tiny tail
+        probabilities then multiply direction *differences* without being
+        lost when subtracting two large means. Scaled arithmetic preserves
+        their products even when the native probabilities round to zero.
 
-            p' = p * (x' - sum(p * x')),
-            logsumexp(x)' = sum(p * x'),
-
-        rooted at the supplied coefficient-zero values. Softmax and
-        logsumexp use the native softmax probabilities; log-softmax uses
-        exp of its native output. All avoid subtracting a large common
-        offset from a rounded logsumexp value.
+        Coefficient recurrences divide by the order before multiplying.
+        ``log_probability_zero`` requests log-softmax as the second result;
+        its higher coefficients use centered quantities directly.
         """
+        if not _return_scaled and torch.is_grad_enabled() and any(x.requires_grad for x in X):
+            from ._normalization import normalization_series
 
-        P = [None] * (self.degree + 1)
-        L = [None] * (self.degree + 1)
-        centered_derivative = [None] * self.degree
+            return normalization_series(X, dim, log_probability_zero is not None)
+        if _return_scaled and torch.is_grad_enabled() and X[0].requires_grad:
+            # A later reverse derivative must also preserve the complement
+            # of a base probability rounded to one. Native log-softmax's
+            # backward only sees its rounded output, so reuse our analytic
+            # rule for this coefficient-zero normalization as well.
+            from ._normalization import normalization_series
 
-        P[0] = probability_zero
-        L[0] = logsumexp_zero
+            log_probability = normalization_series((X[0],), dim, True)[1][0]
+        else:
+            log_probability = torch.log_softmax(X[0], dim=dim)
+        P = [ScaledTensor.from_log(log_probability)]
+        source = [ScaledTensor.from_tensor(x) for x in X]
+        centered = [None]
+        normalizers = [None]
+        L = [ScaledTensor.from_tensor(logsumexp_zero)]
 
-        # Coefficient m of sum(P(t) * X'(t)).  At iteration m all
-        # required P[0:m+1] coefficients are already available.
-        for m in range(self.degree):
-            logsumexp_derivative = torch.zeros_like(L[0])
-            for i in range(m + 1):
-                logsumexp_derivative = logsumexp_derivative + (
-                    P[i] * ((m - i + 1) * X[m - i + 1])
-                ).sum(dim=dim, keepdim=True)
-
-            L[m + 1] = logsumexp_derivative / (m + 1)
-            centered_derivative[m] = (
-                (m + 1) * X[m + 1] - logsumexp_derivative
+        index = None if X[0].numel() == 0 else X[0].detach().argmax(dim=dim, keepdim=True)
+        for coefficient, scaled in zip(X[1:], source[1:]):
+            # The shift is algebraically arbitrary; its detached selection
+            # need not become part of the coefficient autograd graph.
+            offset = (
+                coefficient.detach().sum(dim=dim, keepdim=True)
+                if index is None else coefficient.detach().gather(dim, index)
             )
+            centered.append(scaled - offset)
 
-            softmax_derivative = torch.zeros_like(P[0])
-            for i in range(m + 1):
-                softmax_derivative = softmax_derivative + (
-                    P[i] * centered_derivative[m - i]
+        # From L' = sum(P * X') and P' = P * (X' - L'). Store
+        # coefficients rather than unscaled derivatives, so neither the
+        # input nor a large intermediate is ever multiplied by the order.
+        for k in range(1, self.degree + 1):
+            normalizer = (P[0] * centered[k]).sum(dim=dim, keepdim=True)
+            # Compute the uncentered P[0] term directly: adding the offset
+            # back after averaging can cancel a small valid derivative.
+            uncentered = (P[0] * source[k]).sum(dim=dim, keepdim=True)
+            for i in range(1, k):
+                term = (
+                    P[i] * centered[k - i] * ((k - i) / k)
+                ).sum(dim=dim, keepdim=True)
+                normalizer = normalizer + term
+                uncentered = uncentered + term
+            normalizers.append(normalizer)
+            L.append(uncentered)
+
+            coefficient = P[0] * (centered[k] - normalizers[k])
+            for i in range(1, k):
+                coefficient = coefficient + (
+                    P[i] * (centered[k - i] - normalizers[k - i]) * ((k - i) / k)
                 )
-            P[m + 1] = softmax_derivative / (m + 1)
+            P.append(coefficient)
 
-        return P, L
+        if _return_scaled:
+            if log_probability_zero is not None:
+                L = [ScaledTensor.from_tensor(log_probability_zero)] + [
+                    centered[k] - normalizers[k] for k in range(1, self.degree + 1)
+                ]
+            return P, L
+        probabilities = [
+            probability_zero,
+            *(p.to_tensor(dtype=X[-1].dtype) for p in P[1:]),
+        ]
+        if log_probability_zero is not None:
+            return probabilities, [
+                log_probability_zero,
+                *((centered[k] - normalizers[k]).to_tensor(dtype=X[-1].dtype)
+                  for k in range(1, self.degree + 1)),
+            ]
+        return probabilities, [logsumexp_zero, *(l.to_tensor(dtype=X[-1].dtype) for l in L[1:])]
 
     def poly_log_softmax(self, X, dim):
         out_zero = torch.log_softmax(X[0], dim=dim)
-        probability_zero = torch.exp(out_zero)
-        _, L = self.poly_softmax_and_logsumexp(
+        _, out = self.poly_softmax_and_logsumexp(
             X,
             dim,
-            probability_zero=probability_zero,
+            probability_zero=torch.exp(out_zero),
             logsumexp_zero=torch.logsumexp(X[0], dim=dim, keepdim=True),
+            log_probability_zero=out_zero,
         )
-        return [
-            out_zero,
-            *(X[k] - L[k] for k in range(1, self.degree + 1)),
-        ]
+        return out
 
     def poly_softmax(self, X, dim):
         P, _ = self.poly_softmax_and_logsumexp(
@@ -200,93 +250,34 @@ class SeriesOps:
         return [torch.ones_like(like)] + [torch.zeros_like(like) for _ in range(self.degree)]
 
     def poly_sigmoid(self, X):
-        # Generate coefficients from s' = s(1-s)x', rooted at the exact
-        # native sigmoid value used by PyTorch's SiLU backward.
-        Y = [None] * (self.degree + 1)
-        Q = [None] * self.degree
-        Y[0] = torch.sigmoid(X[0])
+        from ._activations import activation_series
+        return activation_series(X, "sigmoid")
 
-        for m in range(self.degree):
-            square_coefficient = Y[0] * Y[m]
-            for i in range(1, m + 1):
-                square_coefficient = square_coefficient + Y[i] * Y[m - i]
-            Q[m] = Y[m] - square_coefficient
-
-            derivative_coefficient = Q[0] * ((m + 1) * X[m + 1])
-            for i in range(1, m + 1):
-                derivative_coefficient = derivative_coefficient + (
-                    Q[i] * ((m - i + 1) * X[m - i + 1])
-                )
-            Y[m + 1] = derivative_coefficient / (m + 1)
-
-        return Y
+    def poly_sigmoid_grad(self, X):
+        from ._activations import activation_series
+        return activation_series(X, "sigmoid", derivative_order=1)
 
     def poly_tanh(self, X):
-        Y = [None] * (self.degree + 1)
-        Q = [None] * (self.degree + 1)
-        Y[0] = torch.tanh(X[0])
-        Q[0] = 1 - Y[0] * Y[0]
+        from ._activations import activation_series
+        return (activation_series(X, "tanh"),
+                activation_series(X, "tanh", derivative_order=1))
 
-        for k in range(1, self.degree + 1):
-            s = X[1] * Q[k - 1]
-            for i in range(2, k + 1):
-                s = s + i * X[i] * Q[k - i]
-            Y[k] = s / k
+    def poly_silu(self, X):
+        from ._activations import activation_series
+        return activation_series(X, "silu")
 
-            y2 = Y[0] * Y[k]
-            for i in range(1, k + 1):
-                y2 = y2 + Y[i] * Y[k - i]
-            Q[k] = -y2
-
-        return Y, Q
-
-    def poly_normal_cdf_and_pdf(self, X):
-        X2 = self.conv(X, X)
-        phi = self.poly_exp([-0.5 * x for x in X2])
-        phi = [x / math.sqrt(2 * math.pi) for x in phi]
-
-        cdf = [None] * (self.degree + 1)
-        cdf[0] = 0.5 * (1 + torch.erf(X[0] / math.sqrt(2)))
-
-        for k in range(1, self.degree + 1):
-            s = X[1] * phi[k - 1]
-            for i in range(2, k + 1):
-                s = s + i * X[i] * phi[k - i]
-            cdf[k] = s / k
-
-        return cdf, phi
+    def poly_silu_grad(self, X):
+        from ._activations import activation_series
+        return activation_series(X, "silu", derivative_order=1)
 
     def poly_gelu(self, X, approximate):
-        if approximate == "none":
-            cdf, _ = self.poly_normal_cdf_and_pdf(X)
-            return self.conv(X, cdf)
-
-        if approximate == "tanh":
-            one = self.poly_one(X[0])
-            X2 = self.conv(X, X)
-            X3 = self.conv(X2, X)
-            scale = math.sqrt(2 / math.pi)
-            U = [scale * (X[k] + 0.044715 * X3[k]) for k in range(self.degree + 1)]
-            T, _ = self.poly_tanh(U)
-            return [0.5 * y for y in self.conv(X, [one[k] + T[k] for k in range(self.degree + 1)])]
-
-        raise NotImplementedError(f"PolyTensor does not implement GELU approximate={approximate!r}")
+        from ._activations import activation_series
+        if approximate not in ("none", "tanh"):
+            raise NotImplementedError(f"PolyTensor does not implement GELU approximate={approximate!r}")
+        return activation_series(X, "gelu" if approximate == "none" else "gelu_tanh")
 
     def poly_gelu_grad(self, X, approximate):
-        if approximate == "none":
-            cdf, phi = self.poly_normal_cdf_and_pdf(X)
-            x_phi = self.conv(X, phi)
-            return [cdf[k] + x_phi[k] for k in range(self.degree + 1)]
-
-        if approximate == "tanh":
-            one = self.poly_one(X[0])
-            X2 = self.conv(X, X)
-            X3 = self.conv(X2, X)
-            scale = math.sqrt(2 / math.pi)
-            U = [scale * (X[k] + 0.044715 * X3[k]) for k in range(self.degree + 1)]
-            T, Q = self.poly_tanh(U)
-            Udx = [scale * (one[k] + 3 * 0.044715 * X2[k]) for k in range(self.degree + 1)]
-            x_qudx = self.conv(X, self.conv(Q, Udx))
-            return [0.5 * (one[k] + T[k] + x_qudx[k]) for k in range(self.degree + 1)]
-
-        raise NotImplementedError(f"PolyTensor does not implement GELU approximate={approximate!r}")
+        from ._activations import activation_series
+        if approximate not in ("none", "tanh"):
+            raise NotImplementedError(f"PolyTensor does not implement GELU approximate={approximate!r}")
+        return activation_series(X, "gelu" if approximate == "none" else "gelu_tanh", derivative_order=1)
