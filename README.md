@@ -11,6 +11,17 @@ Directions may be complex.
 Install from this checkout: `pip install .`. The planned PyPI command is
 `pip install polytensors`; the package has not been published yet.
 
+Compute the Taylor coefficients of `exp(t)` at zero:
+
+```python
+import torch
+from polytensors import PolyTensor
+
+Z = PolyTensor((0, 1), degree=5)
+Y = torch.exp(Z)
+print(torch.stack(Y.coeffs))  # coefficients 1/k! for k = 0, ..., 5
+```
+
 For training, replace all trainable parameters with `PolyTensor`s **before
 constructing the optimizer**, using the same degree as the polynomial inputs.
 Keep their initial values and set higher coefficients to zero unless you are
