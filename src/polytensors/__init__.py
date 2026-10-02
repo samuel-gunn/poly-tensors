@@ -1,4 +1,4 @@
-"""Higher-order directional automatic differentiation for PyTorch."""
+"""PolyTensors: higher-order directional automatic differentiation for PyTorch."""
 
 from ._tensor import PolyTensor
 

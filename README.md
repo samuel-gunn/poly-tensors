@@ -1,4 +1,4 @@
-# poly-tensors
+# PolyTensors
 
 Higher-order directional automatic differentiation for PyTorch. The only public
 export is `PolyTensor`.
@@ -8,7 +8,8 @@ export is `PolyTensor`.
 is the order-`k` directional derivative divided by `k!`; `.value` is coefficient
 zero. Directions may be complex. There is no fixed maximum order.
 
-Install from this checkout: `pip install .`
+Install from this checkout: `pip install .`. The planned PyPI command is
+`pip install polytensors`; the package has not been published yet.
 
 This example differentiates two gradient-descent updates with respect to the
 initial weight:

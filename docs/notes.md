@@ -1,4 +1,4 @@
-# Implementation and numerical notes
+# PolyTensors implementation and numerical notes
 
 This is an early package, not a drop-in replacement for arbitrary PyTorch
 programs. The library is separated into `_tensor.py` (datatype and autograd
