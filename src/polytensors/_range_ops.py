@@ -10,22 +10,26 @@ NOT_HANDLED = object()
 
 
 def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve):
+    from ._plain import PlainTensor, plain_concatenate, plain_polynomial_product, plain_range_enabled
+
     aten = torch.ops.aten
     count = degree + 1
     like = polys[0].value
+    plain = plain_range_enabled()
+    Coefficient = PlainTensor if plain else S
 
     def is_poly(value):
         return hasattr(value, "coeffs")
 
     def lift(value):
         if is_poly(value):
-            return get_scaled(value) or tuple(S.from_tensor(c) for c in value.coeffs)
+            return get_scaled(value) or tuple(Coefficient.from_tensor(c) for c in value.coeffs)
         if not isinstance(value, torch.Tensor):
             dtype = torch.result_type(like, value)
             value = torch.as_tensor(value, dtype=dtype, device=like.device)
         if not (value.is_floating_point() or value.is_complex()):
             value = value.to(dtype=like.dtype)
-        return (S.from_tensor(value), *(S.from_tensor(torch.zeros_like(value)) for _ in range(degree)))
+        return (Coefficient.from_tensor(value), *(Coefficient.from_tensor(torch.zeros_like(value)) for _ in range(degree)))
 
     def dtypes(values):
         result = []
@@ -60,6 +64,9 @@ def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve
 
     def convolution(a, b, *, matrix=False):
         from ._scaled_matmul import scaled_polynomial_product
+
+        if plain:
+            return plain_polynomial_product(a, b, matrix=matrix)
 
         return scaled_polynomial_product(a, b, matrix=matrix)
 
@@ -214,6 +221,8 @@ def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve
         dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
         operation = torch.cat if func is aten.cat.default else torch.stack
         def combine(items):
+            if plain:
+                return plain_concatenate(items, operation, dim)
             if any(item.mantissa.is_complex() for item in items):
                 return S._from_parts(combine([item.real for item in items]),
                                      combine([item.imag for item in items]))

@@ -171,6 +171,31 @@ class PolyTensor(torch.Tensor):
 
     @classmethod
     @contextlib.contextmanager
+    def plain_range(cls):
+        """Use ordinary floating-point range for coefficient arithmetic.
+
+        By default, supported operators carry private binary exponents so that
+        coefficients beyond the dtype's range survive intermediate operations
+        (see ``docs/notes.md``). That bookkeeping adds substantial time and
+        memory. Inside this context, arithmetic, reduction, and shape rules use
+        plain tensors, and no private exponents are attached or consulted.
+        Coefficients then have exactly the range of their dtype: use it when
+        values are known to stay well inside that range (e.g. float64
+        training at ordinary magnitudes). Nonlinear rules keep their
+        numerically careful series evaluation in both modes. The setting is
+        context-local and applies to backward passes run inside the context.
+        """
+
+        from ._plain import _plain_range
+
+        token = _plain_range.set(True)
+        try:
+            yield
+        finally:
+            _plain_range.reset(token)
+
+    @classmethod
+    @contextlib.contextmanager
     def coefficient_autograd(cls):
         """Build an ordinary autograd graph for polynomial coefficients.
 
@@ -227,6 +252,13 @@ class PolyTensor(torch.Tensor):
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
+        # Composite operations without a native PolyTensor rule are decomposed
+        # above Autograd, so forward series and backward both use tested rules.
+        from ._decompositions import maybe_decompose
+
+        result = maybe_decompose(func, args, kwargs)
+        if result is not NotImplemented:
+            return result
         # These native autograd formulas recover derivatives from rounded
         # outputs. Intercept above Autograd so backward can instead use the
         # original input, including for subsequent reverse derivatives.

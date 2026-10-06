@@ -94,3 +94,22 @@ one gradient call. `tests/test_training.py` contains complete, independently
 checked examples. Do not combine wrapper autograd with coefficient autograd, or
 wrap coefficient-autograd values in `nn.Parameter`, whose construction detaches
 the coefficients. General module adaptation is not provided yet.
+
+## Plain-range mode
+
+```python
+with PolyTensor.plain_range():
+    ...  # forward, backward, and optimizer updates
+```
+
+By default, supported operators carry private binary exponents so that
+coefficients beyond the dtype's range survive intermediate operations. That
+bookkeeping costs substantial time and memory. Inside `plain_range()`,
+arithmetic, reductions, shape operations, exp/log, tanh/sigmoid/GELU (exact),
+softmax/log-softmax/logsumexp, their backward rules, and
+`scaled_dot_product_attention` (decomposed into its reference definition) use
+ordinary tensors in the coefficient dtype. Results are those of ordinary
+floating-point arithmetic, with the dtype's range. Use it when coefficients stay
+well inside that range, e.g. float64 training at ordinary magnitudes; in that
+regime it is typically 10-40x faster. The setting is context-local; run backward
+inside the same context.

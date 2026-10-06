@@ -75,6 +75,20 @@ PyTorch's complex semantics instead: native real-only kernels may reject it,
 and reverse-mode gradients involve conjugation. Complex-base training is not
 interchangeable with complex directions through a real training computation.
 
+## Later fixes and additions
+
+- `torch.ldexp` is implemented as `value * 2**power` in some PyTorch releases
+  (e.g. 2.9). For large |power| the power of two itself overflows or underflows,
+  which gave NaN or premature zeros in extended-range arithmetic (94 test failures
+  on PyTorch 2.9.1). Binary scaling now applies the exponent in a fixed number of
+  range-safe steps.
+- Constructing a scaled coefficient no longer copies a Python scalar exponent
+  host-to-device on every call (a synchronization per operation on CUDA).
+- `rms_norm` is decomposed into supported operations above Autograd.
+- NLL loss forward/backward split complex coefficients into real and imaginary
+  parts (linearity), because CUDA kernels reject complex inputs.
+- `PolyTensor.plain_range()` (see `api.md`).
+
 ## Correctness and stability fixes made during extraction
 
 - Mixed degrees previously truncated silently or failed depending on operand

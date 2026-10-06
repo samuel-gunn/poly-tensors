@@ -67,3 +67,20 @@ def test_complex_components_have_independent_exponent_ranges():
     imaginary = (S(value) - S(value.real)).to_tensor()
     torch.testing.assert_close(imaginary, torch.tensor(1e-300j, dtype=torch.complex128), atol=0, rtol=0)
     torch.testing.assert_close(S(value).conj().to_tensor(), value.conj(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_binary_scale_never_materializes_out_of_range_powers_of_two(dtype):
+    # torch.ldexp may be implemented as value * 2**power; 2**power alone can be
+    # inf/0 for exponents that still give representable (or exactly zero) results.
+    from polytensors._scaled import _safe_ldexp
+    info = torch.finfo(dtype)
+    max_exponent = math.frexp(info.max)[1]
+    value = torch.tensor([0.0, 1.5, -1.0], dtype=dtype)
+    huge = torch.full((3,), 3 * max_exponent, dtype=torch.int32)
+    out = _safe_ldexp(value, huge)
+    assert out[0] == 0 and torch.isinf(out[1]) and out[2] == -math.inf
+    # Results that are representable (here subnormal) must match an exact ldexp.
+    for shift in (-(max_exponent + 10), -(2 * max_exponent - 20)):
+        out = _safe_ldexp(torch.tensor([1.5], dtype=dtype), torch.tensor([shift], dtype=torch.int32))
+        assert out.item() == torch.tensor(math.ldexp(1.5, shift), dtype=dtype).item()

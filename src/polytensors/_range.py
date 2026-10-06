@@ -16,6 +16,10 @@ def _discard(value):
 
 
 def attach_scaled(value, coefficients):
+    from ._plain import plain_range_enabled
+
+    if plain_range_enabled():
+        return value
     # Inference tensors have no version counter, so mutation cannot be tracked.
     if any(c.is_inference() for c in value.coeffs):
         _discard(value)
@@ -32,6 +36,10 @@ def attach_scaled(value, coefficients):
 
 
 def get_scaled(value):
+    from ._plain import plain_range_enabled
+
+    if plain_range_enabled():
+        return None
     coefficients = getattr(value, "_scaled_coefficients", None)
     if coefficients is None:
         return None

@@ -3,9 +3,27 @@
 import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
+from ._plain import plain_range_enabled
 from ._series import SeriesOps
 
 aten = torch.ops.aten
+
+
+def _linear_complex_split(func, value, args, kwargs, first=False):
+    """Apply an operation that is linear in ``value`` to complex coefficients.
+
+    Several native kernels (e.g. CUDA NLL loss) reject complex inputs. For a
+    function linear in its first argument, f(a + ib) = f(a) + i f(b). With
+    ``first=True`` the function returns a tuple whose first element is the
+    linear output and whose remaining elements do not depend on ``value``.
+    """
+    if not value.is_complex():
+        return func(value, *args, **kwargs)
+    real = func(value.real.contiguous(), *args, **kwargs)
+    imag = func(value.imag.contiguous(), *args, **kwargs)
+    if first:
+        return (torch.complex(real[0], imag[0]),) + tuple(real[1:])
+    return torch.complex(real, imag)
 
 
 def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
@@ -104,8 +122,9 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         values = (series.poly_log_softmax(coefficients, dim) if log
                   else series.poly_softmax(coefficients, dim))
         output = wrap(values)
-        probabilities, normalizers = normalization_scaled_series(coefficients, dim, log)
-        attach_scaled(output, normalizers if log else probabilities)
+        if not plain_range_enabled():
+            probabilities, normalizers = normalization_scaled_series(coefficients, dim, log)
+            attach_scaled(output, normalizers if log else probabilities)
         output._normalization_input_coeffs = tuple(coefficients)
         output._normalization_dim = dim
         return output
@@ -114,8 +133,9 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         from ._activations import _evaluate_scaled, activation_series
         from ._range import attach_scaled
 
-        output = attach_scaled(wrap(activation_series(coefficients, kind)),
-                               _evaluate_scaled(coefficients, kind, 0))
+        output = wrap(activation_series(coefficients, kind))
+        if not plain_range_enabled():
+            output = attach_scaled(output, _evaluate_scaled(coefficients, kind, 0))
         output._activation_input_coeffs = coefficients
         return output
 
@@ -285,6 +305,13 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         )
         return [native_loss, *out[1:]]
 
+    if plain_range_enabled():
+        from ._plain import plain_rule
+
+        result = plain_rule(func, args, kwargs, lift, wrap)
+        if result is not NotImplemented:
+            return result
+
     from ._range_ops import NOT_HANDLED, dispatch_range
 
     ranged = dispatch_range(func, args, kwargs, polys=polys, degree=D,
@@ -379,6 +406,8 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         from ._range import attach_scaled
 
         coefficients = lift(args[0])
+        if plain_range_enabled():
+            return wrap(series.poly_exp(coefficients))
         return attach_scaled(wrap(series.poly_exp(coefficients)), series._poly_exp_scaled(coefficients))
 
     if func is aten.sin.default:
@@ -448,8 +477,9 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         from ._normalization import normalization_scaled_series
         from ._range import attach_scaled
 
-        scaled, _ = normalization_scaled_series(safe, dim)
-        attach_scaled(output, (c.masked_fill(excluded, 0) for c in scaled))
+        if not plain_range_enabled():
+            scaled, _ = normalization_scaled_series(safe, dim)
+            attach_scaled(output, (c.masked_fill(excluded, 0) for c in scaled))
         output._normalization_input_coeffs = safe
         output._normalization_dim = dim
         output._normalization_excluded = excluded
@@ -483,7 +513,7 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
             raise NotImplementedError(
                 "PolyTensor NLL loss requires ordinary targets and class weights"
             )
-        outs = [func(c, *plain(args[1:]), **plain(kwargs)) for c in lift(args[0])]
+        outs = [_linear_complex_split(func, c, plain(args[1:]), plain(kwargs), first=True) for c in lift(args[0])]
         return wrap(out[0] for out in outs), outs[0][1]
 
     if func is aten.cross_entropy_loss.default:
@@ -503,7 +533,7 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
                 "PolyTensor NLL loss requires ordinary targets, class weights, and total weight"
             )
         grad_output = args[0]
-        return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+        return wrap(_linear_complex_split(func, g, plain(args[1:]), plain(kwargs)) for g in lift(grad_output))
 
     if func is aten._log_softmax_backward_data.default:
         grad_output, output, dim = args[:3]
@@ -618,23 +648,23 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
 
     if func is aten.native_dropout_backward.default:
         grad_output = args[0]
-        return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+        return wrap(_linear_complex_split(func, g, plain(args[1:]), plain(kwargs)) for g in lift(grad_output))
 
     if func is aten.avg_pool2d_backward.default:
         grad_output = args[0]
-        return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+        return wrap(_linear_complex_split(func, g, plain(args[1:]), plain(kwargs)) for g in lift(grad_output))
 
     if func is aten.embedding_dense_backward.default:
         grad_output = args[0]
-        return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+        return wrap(_linear_complex_split(func, g, plain(args[1:]), plain(kwargs)) for g in lift(grad_output))
 
     if func is aten.slice_backward.default:
         grad_output = args[0]
-        return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+        return wrap(_linear_complex_split(func, g, plain(args[1:]), plain(kwargs)) for g in lift(grad_output))
 
     if func is aten.select_backward.default:
         grad_output = args[0]
-        return wrap(func(g, *plain(args[1:]), **plain(kwargs)) for g in lift(grad_output))
+        return wrap(_linear_complex_split(func, g, plain(args[1:]), plain(kwargs)) for g in lift(grad_output))
 
     if func is aten.convolution_backward.default:
         grad_output, x, weight = args[:3]

@@ -10,12 +10,45 @@ import math
 import torch
 
 
+def _safe_ldexp(value, power):
+    """value * 2**power without materializing an out-of-range 2**power.
+
+    Some PyTorch releases implement ``torch.ldexp`` as ``value * 2**power``.
+    For large |power| the power of two itself overflows to infinity or
+    underflows to zero, giving 0 * inf = NaN or a premature zero. Applying the
+    exponent in steps that are each representable is exact (multiplication by
+    a power of two) except for the final, genuine overflow or underflow.
+    """
+    step, steps = _ldexp_steps(value.dtype)
+    power = power.clamp(-step * steps, step * steps)
+    out = value
+    remaining = power
+    # A fixed number of steps avoids a device synchronization per call. Each
+    # step's power of two is finite and normal, so native ldexp is safe here.
+    for _ in range(steps):
+        part = remaining.clamp(-step, step)
+        out = torch.ldexp(out, part)
+        remaining = remaining - part
+    return out
+
+
+def _ldexp_steps(dtype):
+    """Largest safe single power-of-two step and the number needed to span the range."""
+    info = torch.finfo(dtype)
+    max_exponent = math.frexp(info.max)[1]              # 2**(max_exponent-1) <= max
+    min_exponent = math.frexp(info.tiny)[1]             # smallest normal exponent
+    digits = -math.frexp(info.eps)[1] + 2               # mantissa bits (subnormal span)
+    step = max_exponent - 2                             # 2**step is finite and normal
+    span = max_exponent - min_exponent + digits + 2     # beyond this, rounds to 0 or inf
+    return step, -(-span // step)
+
+
 class _BinaryScale(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, power):
         ctx.save_for_backward(power)
         ctx.input_shape = value.shape
-        return torch.ldexp(value, power)
+        return _safe_ldexp(value, power)
 
     @staticmethod
     def backward(ctx, gradient):
@@ -56,7 +89,12 @@ class ScaledTensor:
         if mantissa.dtype in (torch.float16, torch.bfloat16):
             mantissa = mantissa.float()
         exponent_dtype = torch.float32 if mantissa.device.type == "mps" else torch.float64
-        exponent = torch.as_tensor(exponent, dtype=exponent_dtype, device=mantissa.device).detach()
+        if isinstance(exponent, torch.Tensor):
+            exponent = exponent.to(dtype=exponent_dtype, device=mantissa.device).detach()
+        else:
+            # Create Python scalars directly on the device; as_tensor would
+            # perform a synchronous host-to-device copy on every construction.
+            exponent = torch.full((), exponent, dtype=exponent_dtype, device=mantissa.device)
         magnitude = _magnitude(mantissa).detach()
         _, shift = torch.frexp(magnitude)
         # Use [1,2), rather than [1/2,1), so conversion of a finite maximum
