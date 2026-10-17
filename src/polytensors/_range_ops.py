@@ -26,7 +26,7 @@ def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve
             return get_scaled(value) or tuple(Coefficient.from_tensor(c) for c in value.coeffs)
         if not isinstance(value, torch.Tensor):
             dtype = torch.result_type(like, value)
-            value = torch.as_tensor(value, dtype=dtype, device=like.device)
+            value = torch.full((), value, dtype=dtype, device=like.device)   # no blocking host-to-device copy
         if not (value.is_floating_point() or value.is_complex()):
             value = value.to(dtype=like.dtype)
         return (Coefficient.from_tensor(value), *(Coefficient.from_tensor(torch.zeros_like(value)) for _ in range(degree)))
@@ -85,13 +85,38 @@ def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve
                for c, dest in zip(coefficients, target.coeffs)):
             raise RuntimeError("cannot copy complex PolyTensor coefficients into real coefficient storage")
         for dest, value in zip(target.coeffs, coefficients):
-            dest.copy_(value.to_tensor(dest.dtype))
+            if value.mantissa is not dest:   # an order the operation leaves unchanged
+                dest.copy_(value.to_tensor(dest.dtype))
         return attach_scaled(target, coefficients)
 
     add = (aten.add.Tensor, aten.add.Scalar, aten.add_.Tensor, aten.add_.Scalar)
     sub = (aten.sub.Tensor, aten.sub.Scalar, aten.sub_.Tensor, aten.sub_.Scalar)
     mul = (aten.mul.Tensor, aten.mul.Scalar, aten.mul_.Tensor, aten.mul_.Scalar)
     div = (aten.div.Tensor, aten.div.Scalar, aten.div_.Tensor, aten.div_.Scalar)
+    if plain and func in (*add, *sub, *mul, *div) and not (is_poly(args[0]) and is_poly(args[1])):
+        # One operand is a constant (a Python number or an ordinary tensor): only its constant term is
+        # nonzero, so skip lifting it to a series. Lifting a Python number allocates a device tensor, a
+        # blocking host-to-device copy per operation, and the series product spends kernels on zeros.
+        a, b = args[:2]
+        alpha = kwargs.get("alpha", 1)
+        mutable = func._schema.is_mutable
+        if func in mul or (func in div and is_poly(a)):
+            if is_poly(a):
+                result = tuple(PlainTensor(c * b if func in mul else c / b) for c in a.coeffs)
+            else:
+                result = tuple(PlainTensor(a * c) for c in b.coeffs)
+            return write(a, result) if mutable else output(result, (a, b))
+        if func in (*add, *sub):
+            sign = alpha if func in add else -alpha
+            if is_poly(a):
+                head = a.coeffs[0] + sign * b
+                # out of place, the unchanged orders still need their own storage
+                rest = a.coeffs[1:] if mutable else tuple(c.clone() for c in a.coeffs[1:])
+            else:
+                head = a + sign * b.coeffs[0]
+                rest = tuple(sign * c for c in b.coeffs[1:])
+            result = tuple(PlainTensor(c) for c in (head, *rest))
+            return write(a, result) if mutable else output(result, (a, b))
     if func in (*add, *sub, *mul, *div):
         a, b = args[:2]
         A, B = lift(a), lift(b)

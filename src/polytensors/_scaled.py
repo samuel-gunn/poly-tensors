@@ -255,7 +255,7 @@ class ScaledTensor:
         if isinstance(other, ScaledTensor):
             return other
         if not isinstance(other, torch.Tensor):
-            other = torch.as_tensor(other, dtype=self.mantissa.dtype, device=self.mantissa.device)
+            other = torch.full((), other, dtype=self.mantissa.dtype, device=self.mantissa.device)
         return ScaledTensor.from_tensor(other)
 
     def __neg__(self):

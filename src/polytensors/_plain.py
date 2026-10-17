@@ -70,7 +70,7 @@ class PlainTensor:
     def masked_fill(self, mask, value=0):
         other = self._coerce(value)
         if not isinstance(other, torch.Tensor):
-            other = torch.as_tensor(other, dtype=self.mantissa.dtype, device=self.mantissa.device)
+            other = torch.full((), other, dtype=self.mantissa.dtype, device=self.mantissa.device)
         dtype = torch.promote_types(self.mantissa.dtype, other.dtype)
         return PlainTensor(torch.where(mask, other.to(dtype), self.mantissa.to(dtype)))
 

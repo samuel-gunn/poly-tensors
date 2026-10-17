@@ -13,6 +13,7 @@ _retention_scopes = contextvars.ContextVar(
     "polytensor_retention_scopes",
     default=(),
 )
+_COMPLEX_OF = {torch.float16: torch.complex32, torch.float32: torch.complex64, torch.float64: torch.complex128}
 _coefficient_autograd_enabled = contextvars.ContextVar(
     "polytensor_coefficient_autograd_enabled",
     default=False,
@@ -38,6 +39,8 @@ class PolyTensor(torch.Tensor):
         if isinstance(coeffs, PolyTensor):
             coeffs = coeffs.coeffs
         coeffs = tuple(coeffs)
+        if degree is None and PolyTensor._well_formed(coeffs):
+            return coeffs
         if not coeffs:
             raise ValueError("at least one coefficient is required")
         if degree is not None:
@@ -91,6 +94,36 @@ class PolyTensor(torch.Tensor):
                 c = c.clone()
             independent.append(c)
         return tuple(independent)
+
+    @staticmethod
+    def _well_formed(coeffs):
+        """Whether ``coeffs`` already satisfy every rule of ``_coerce_coeffs`` (the common case for rule
+        outputs): plain dense tensors of one shape and device, a floating or complex base, higher orders all
+        of one dtype (the base's, or its complex counterpart for complex directions), and no overlaps."""
+        if not coeffs:
+            return False
+        base = coeffs[0]
+        if type(base) is not torch.Tensor or base.layout != torch.strided:
+            return False
+        dtype = base.dtype
+        if not (dtype.is_floating_point or dtype.is_complex):
+            return False
+        shape, device = base.shape, base.device
+        higher = None
+        for c in coeffs[1:]:
+            if type(c) is not torch.Tensor or c.layout != torch.strided or c.shape != shape or c.device != device:
+                return False
+            if higher is None:
+                higher = c.dtype
+                if higher != dtype and _COMPLEX_OF.get(dtype) != higher:
+                    return False
+            elif c.dtype != higher:
+                return False
+        for i in range(1, len(coeffs)):
+            for j in range(i):
+                if torch._C._overlaps(coeffs[i], coeffs[j]):
+                    return False
+        return True
 
     def _set_coeffs(self, coeffs):
         self.coeffs = self._coerce_coeffs(coeffs)
