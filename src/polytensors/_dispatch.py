@@ -26,6 +26,67 @@ def _linear_complex_split(func, value, args, kwargs, first=False):
     return torch.complex(real, imag)
 
 
+# The recursive helpers are module-level functions: a recursive local closure is a reference cycle
+# (function -> cell -> function), and its cells would keep every operand and result of the operation, including
+# coefficient storage, alive until Python's cyclic collector runs. A collection in the middle of a backward pass
+# then frees wrappers in arbitrary order.
+
+def _is_poly_wrapper(x):
+    from ._tensor import PolyTensor
+
+    return type(x) is PolyTensor
+
+
+def _is_initialized_poly(x):
+    return _is_poly_wrapper(x) and hasattr(x, "coeffs")
+
+
+def _collect(x, polys, poly_wrappers):
+    if _is_initialized_poly(x):
+        polys.append(x)
+        poly_wrappers.append(x)
+    elif _is_poly_wrapper(x):
+        poly_wrappers.append(x)
+    elif isinstance(x, (tuple, list)):
+        for y in x:
+            _collect(y, polys, poly_wrappers)
+    elif isinstance(x, dict):
+        for y in x.values():
+            _collect(y, polys, poly_wrappers)
+
+
+def _has_poly(x):
+    if _is_initialized_poly(x):
+        return True
+    if isinstance(x, (tuple, list)):
+        return any(_has_poly(y) for y in x)
+    if isinstance(x, dict):
+        return any(_has_poly(y) for y in x.values())
+    return False
+
+
+def _plain(x):
+    if _is_poly_wrapper(x):
+        return x.value
+    if isinstance(x, tuple):
+        return tuple(_plain(y) for y in x)
+    if isinstance(x, list):
+        return [_plain(y) for y in x]
+    if isinstance(x, dict):
+        return {k: _plain(v) for k, v in x.items()}
+    return x
+
+
+def _convert_scaled(value, target):
+    from ._scaled import ScaledTensor
+
+    if value.mantissa.is_complex():
+        return ScaledTensor._from_parts(_convert_scaled(value.real, target.real),
+                                        _convert_scaled(value.imag, target.real))
+    return ScaledTensor(value.mantissa.to(device=target.device, dtype=target.dtype),
+                        value.exponent.to(device=target.device))
+
+
 def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
     from ._tensor import PolyTensor
 
@@ -33,28 +94,13 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
 
     polys = []
     poly_wrappers = []
+    is_poly_wrapper = _is_poly_wrapper
+    is_initialized_poly = _is_initialized_poly
+    has_poly = _has_poly
+    plain = _plain
 
-    def is_poly_wrapper(x):
-        return type(x) is PolyTensor
-
-    def is_initialized_poly(x):
-        return is_poly_wrapper(x) and hasattr(x, "coeffs")
-
-    def collect(x):
-        if is_initialized_poly(x):
-            polys.append(x)
-            poly_wrappers.append(x)
-        elif is_poly_wrapper(x):
-            poly_wrappers.append(x)
-        elif isinstance(x, (tuple, list)):
-            for y in x:
-                collect(y)
-        elif isinstance(x, dict):
-            for y in x.values():
-                collect(y)
-
-    collect(args)
-    collect(kwargs)
+    _collect(args, polys, poly_wrappers)
+    _collect(kwargs, polys, poly_wrappers)
 
     if len(polys) != len(poly_wrappers):
         raise RuntimeError(
@@ -151,26 +197,6 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
 
     def is_poly(x):
         return is_initialized_poly(x)
-
-    def has_poly(x):
-        if is_initialized_poly(x):
-            return True
-        if isinstance(x, (tuple, list)):
-            return any(has_poly(y) for y in x)
-        if isinstance(x, dict):
-            return any(has_poly(y) for y in x.values())
-        return False
-
-    def plain(x):
-        if is_poly_wrapper(x):
-            return x.value
-        if isinstance(x, tuple):
-            return tuple(plain(y) for y in x)
-        if isinstance(x, list):
-            return [plain(y) for y in x]
-        if isinstance(x, dict):
-            return {k: plain(v) for k, v in x.items()}
-        return x
 
     def coefficient_dtype(coefficient, dtype):
         if not coefficient.is_complex() or dtype is None or dtype.is_complex:
@@ -810,13 +836,7 @@ def dispatch(func, types, args=(), kwargs=None, *, coefficient_autograd=False):
         result = wrap(convert(c) for c in lift(args[0]))
         scaled = get_scaled(args[0])
         if scaled is not None:
-            def convert_scaled(value, target):
-                if value.mantissa.is_complex():
-                    return ScaledTensor._from_parts(convert_scaled(value.real, target.real),
-                                                    convert_scaled(value.imag, target.real))
-                return ScaledTensor(value.mantissa.to(device=target.device, dtype=target.dtype),
-                                    value.exponent.to(device=target.device))
-            attach_scaled(result, (convert_scaled(c, target) for c, target in zip(scaled, result.coeffs)))
+            attach_scaled(result, (_convert_scaled(c, target) for c, target in zip(scaled, result.coeffs)))
         return result
 
     if func in (aten.bernoulli_.float, aten.bernoulli_.Tensor):

@@ -9,6 +9,19 @@ from ._scaled import ScaledTensor as S
 NOT_HANDLED = object()
 
 
+def _combine(items, operation, dim, plain):
+    """cat/stack of coefficients (module level: a recursive local closure would be a reference cycle)."""
+    from ._plain import plain_concatenate
+
+    if plain:
+        return plain_concatenate(items, operation, dim)
+    if any(item.mantissa.is_complex() for item in items):
+        return S._from_parts(_combine([item.real for item in items], operation, dim, plain),
+                             _combine([item.imag for item in items], operation, dim, plain))
+    return S(operation([item.mantissa for item in items], dim=dim),
+             operation([item.exponent.expand(item.mantissa.shape) for item in items], dim=dim))
+
+
 def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve):
     from ._plain import PlainTensor, plain_concatenate, plain_polynomial_product, plain_range_enabled
 
@@ -245,16 +258,8 @@ def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve
         sources = args[0]
         dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
         operation = torch.cat if func is aten.cat.default else torch.stack
-        def combine(items):
-            if plain:
-                return plain_concatenate(items, operation, dim)
-            if any(item.mantissa.is_complex() for item in items):
-                return S._from_parts(combine([item.real for item in items]),
-                                     combine([item.imag for item in items]))
-            return S(operation([item.mantissa for item in items], dim=dim),
-                     operation([item.exponent.expand(item.mantissa.shape) for item in items], dim=dim))
         groups = [lift(source) for source in sources]
-        return output((combine([group[k] for group in groups]) for k in range(count)), sources)
+        return output((_combine([group[k] for group in groups], operation, dim, plain) for k in range(count)), sources)
 
     if func is aten.copy_.default:
         return write(args[0], lift(args[1]))
