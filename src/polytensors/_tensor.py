@@ -144,7 +144,7 @@ class PolyTensor(torch.Tensor):
 
     @classmethod
     @contextlib.contextmanager
-    def retain_wrappers(cls):
+    def retain_wrappers(cls, isolated=False):
         """Keep intermediate PolyTensor wrappers alive through backward.
 
         Wrapper-subclass autograd graphs may otherwise outlive the Python
@@ -157,12 +157,16 @@ class PolyTensor(torch.Tensor):
 
         References are context-local, support nesting, and are released when
         each scope exits (an outer scope also retains its nested wrappers).
+        With ``isolated=True`` the scope's wrappers are retained by this scope
+        only, so they are released when it exits even inside an outer scope:
+        use it for a self-contained forward and backward (e.g. one chunk of a
+        loss) whose graph nothing outside the scope will differentiate through.
         The yielded list is intended only for diagnostics
         such as checking how many wrappers were retained.
         """
 
         refs = []
-        token = _retention_scopes.set((*_retention_scopes.get(), refs))
+        token = _retention_scopes.set((refs,) if isolated else (*_retention_scopes.get(), refs))
         try:
             yield refs
         finally:
