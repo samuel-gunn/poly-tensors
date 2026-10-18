@@ -233,6 +233,27 @@ class PolyTensor(torch.Tensor):
 
     @classmethod
     @contextlib.contextmanager
+    def fused_attention(cls, enabled=True):
+        """Enable or disable the fused degree-1 attention kernels (default: enabled).
+
+        Inside ``plain_range()``, ``torch.nn.functional.scaled_dot_product_attention``
+        on degree-1 real series on CUDA uses flash-style Triton kernels that never
+        form the score matrices and skip masked key blocks: causal attention or a
+        boolean (L, S) mask (e.g. a sliding window), no dropout or GQA, head dim
+        16-128 (16-64 in float64). Other calls use the general series rules. Use
+        ``fused_attention(False)`` to compare against the general rules.
+        """
+
+        from ._fused_attention import _enabled
+
+        token = _enabled.set(bool(enabled))
+        try:
+            yield
+        finally:
+            _enabled.reset(token)
+
+    @classmethod
+    @contextlib.contextmanager
     def coefficient_autograd(cls):
         """Build an ordinary autograd graph for polynomial coefficients.
 

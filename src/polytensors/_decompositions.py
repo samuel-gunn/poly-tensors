@@ -66,5 +66,13 @@ def maybe_decompose(function, args, kwargs):
         bound.update(kwargs)
         if not any(isinstance(v, PolyTensor) for v in bound.values()):
             return NotImplemented
+        from . import _fused_attention
+
+        if _fused_attention.eligible(bound["query"], bound["key"], bound["value"], bound.get("attn_mask"),
+                                     bound.get("dropout_p", 0.0), bound.get("is_causal", False),
+                                     bound.get("enable_gqa", False)):
+            return _fused_attention.attention(bound["query"], bound["key"], bound["value"],
+                                              attn_mask=bound.get("attn_mask"), is_causal=bound.get("is_causal", False),
+                                              scale=bound.get("scale"))
         return _attention(**bound)
     return NotImplemented
