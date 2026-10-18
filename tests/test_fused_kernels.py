@@ -132,3 +132,89 @@ def test_scale_argument():
     for a, b in zip(fused.coeffs, general.coeffs):
         assert _relative(a, b) < 1e-12
     assert math.isclose(_fused_attention.default_scale(64), 0.125)
+
+
+# --- fused cross entropy -------------------------------------------------------------------------------
+
+from polytensors import _fused_cross_entropy  # noqa: E402
+
+
+def _ce_run(fused, dtype, reduction, N=300, C=5000, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    logits = PolyTensor(tuple(3 * torch.randn(N, C, generator=g, device="cuda", dtype=dtype) for _ in range(2)),
+                        requires_grad=True)
+    target = torch.randint(0, C, (N,), generator=g, device="cuda")
+    target[::7] = -1
+    with PolyTensor.retain_wrappers(), PolyTensor.plain_range(), PolyTensor.fused_cross_entropy(fused):
+        assert _fused_cross_entropy.eligible(logits, target, None, reduction, 0.0) == fused
+        loss = F.cross_entropy(logits, target, ignore_index=-1, reduction=reduction)
+        weights = PolyTensor(tuple(torch.randn(loss.shape, generator=g, device="cuda", dtype=dtype)
+                                   for _ in range(2)))
+        (loss * weights).sum().backward()
+    return loss.coeffs, logits.grad.coeffs
+
+
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+def test_fused_cross_entropy_matches_general_rules(reduction):
+    out_f, grad_f = _ce_run(True, torch.float32, reduction)
+    out_g, grad_g = _ce_run(False, torch.float32, reduction)
+    for a, b in zip(out_f, out_g):
+        assert _relative(a, b) < 1e-5
+    for a, b in zip(grad_f, grad_g):
+        assert _relative(a, b) < 1e-5
+
+
+def test_fused_cross_entropy_coefficient_map_gradcheck_like():
+    N, C = 17, 300
+    z = [torch.randn(N, C, device="cuda", dtype=torch.float32, requires_grad=True) for _ in range(2)]
+    y = torch.randint(0, C, (N,), device="cuda")
+    l0, l1 = _fused_cross_entropy.CoefficientCrossEntropy.apply(z[0], z[1], y, -100)
+    zr = [t.detach().double().requires_grad_() for t in z]
+    p = torch.softmax(zr[0], -1)
+    r0 = torch.logsumexp(zr[0], -1) - zr[0].gather(1, y[:, None])[:, 0]
+    r1 = (p * zr[1]).sum(-1) - zr[1].gather(1, y[:, None])[:, 0]
+    c = [torch.randn(N, device="cuda") for _ in range(2)]
+    g = torch.autograd.grad((l0, l1), z, c)
+    gr = torch.autograd.grad((r0, r1), zr, [t.double() for t in c])
+    assert _relative(l0.double(), r0) < 1e-6 and _relative(l1.double(), r1) < 1e-6
+    for a, b in zip(g, gr):
+        assert _relative(a.double(), b) < 1e-5
+
+
+@pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-5), (torch.bfloat16, 2e-2)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_softcapped_cross_entropy_matches_composite(dtype, tol, strided):
+    import polytensors
+
+    N, C, pad, cap = 200, 3000, 64 if strided else 0, 15.0
+    g = torch.Generator(device="cuda").manual_seed(1)
+    full = [40 * torch.randn(N, C + pad, generator=g, device="cuda", dtype=dtype) for _ in range(2)]
+    target = torch.randint(0, C, (N,), generator=g, device="cuda")
+    target[::5] = -1
+    results = []
+    for use_fused in (True, False):
+        logits = PolyTensor(tuple(f.clone() for f in full), requires_grad=True)
+        with PolyTensor.retain_wrappers(), PolyTensor.plain_range(), PolyTensor.fused_cross_entropy(use_fused):
+            sliced = logits[:, :C]
+            if use_fused:
+                loss = PolyTensor.cross_entropy(sliced, target, softcap=cap, ignore_index=-1, reduction="none")
+            else:
+                z = sliced.float()
+                loss = F.cross_entropy(cap * torch.tanh(z / cap), target, ignore_index=-1, reduction="none")
+            w = PolyTensor((torch.linspace(-1, 1, N, device="cuda"), torch.linspace(1, 2, N, device="cuda")))
+            (loss * w).sum().backward()
+        results.append((loss.coeffs, logits.grad.coeffs))
+    (out_f, grad_f), (out_g, grad_g) = results
+    for a, b in zip(out_f, out_g):
+        assert a.dtype == torch.float32 and _relative(a, b.float()) < tol
+    for a, b in zip(grad_f, grad_g):
+        assert _relative(a.float(), b.float()) < tol
+
+
+def test_public_cross_entropy_on_plain_tensors():
+    import polytensors
+
+    z = torch.randn(10, 50, device="cuda")
+    y = torch.randint(0, 50, (10,), device="cuda")
+    expected = F.cross_entropy(15 * torch.tanh(z / 15), y)
+    assert torch.allclose(PolyTensor.cross_entropy(z, y, softcap=15.0), expected)

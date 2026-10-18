@@ -113,3 +113,38 @@ floating-point arithmetic, with the dtype's range. Use it when coefficients stay
 well inside that range, e.g. float64 training at ordinary magnitudes; in that
 regime it is typically 10-40x faster. The setting is context-local; run backward
 inside the same context.
+
+## Fused degree-1 kernels (CUDA)
+
+Inside `plain_range()`, degree-1 series with real coefficients on CUDA use fused
+Triton kernels for the two most expensive operations of a transformer, with no
+change to model code:
+
+- `torch.nn.functional.scaled_dot_product_attention`: a flash-style kernel for
+  the value and tangent of attention and their exact backward. The L x S score
+  matrices are never formed, and key blocks removed by `is_causal=True` or a
+  boolean `attn_mask` (e.g. a sliding window) are skipped. No dropout or GQA;
+  head dims 16-128 in float16/bfloat16/float32, 16-64 in float64. Accumulation
+  is in float32 (float64 for float64 inputs).
+- `torch.nn.functional.cross_entropy` on (N, C) logits with integer targets (no
+  class weights or label smoothing): one streaming pass per row, forward and
+  backward.
+
+`PolyTensor.cross_entropy(logits, target, softcap=None, ignore_index=-100,
+reduction="mean")` adds an optional logit cap `softcap * tanh(logits / softcap)`
+applied inside the same pass; it accepts ordinary tensors too and returns at least
+float32.
+
+Calls outside these conditions (higher degree, complex directions, CPU,
+extended-range mode) use the general series rules. `PolyTensor.fused_attention(False)`
+and `PolyTensor.fused_cross_entropy(False)` switch the kernels off, e.g. to
+compare. Gradient series are exact: for a degree-1 map `y = f(x0 + t x1)`, the
+series backward `(J^T G)(t)` equals the vector-Jacobian product of the coefficient
+map `(x0, x1) -> (y0, y1)` with cotangents `(G1, G0)` and input orders swapped,
+which is what the backward kernels compute.
+
+For low precision, keep parameters (and their coefficients) in float32 and run
+the forward/backward in bfloat16, as in mixed-precision training: cast weights to
+the activation dtype in the forward (e.g. `F.linear(x, w.to(x.dtype))`). All
+coefficients are then bfloat16 in the compute and float32 in the parameters and
+optimizer updates.
