@@ -44,6 +44,9 @@ def _attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
 
 
 _ATTENTION = frozenset((F.scaled_dot_product_attention,))
+_CROSS_ENTROPY = frozenset((F.cross_entropy,))
+_CROSS_ENTROPY_ARGS = ("input", "target", "weight", "size_average", "ignore_index", "reduce", "reduction",
+                       "label_smoothing")
 
 
 def maybe_decompose(function, args, kwargs):
@@ -56,6 +59,21 @@ def maybe_decompose(function, args, kwargs):
         if not any(isinstance(bound.get(k), PolyTensor) for k in ("input", "weight")):
             return NotImplemented
         return _rms_norm(bound["input"], tuple(bound["normalized_shape"]), bound.get("weight"), bound.get("eps"))
+    if function in _CROSS_ENTROPY:
+        # Fused degree-1 rule (otherwise PyTorch decomposes into log_softmax and nll_loss as usual).
+        bound = dict(zip(_CROSS_ENTROPY_ARGS, args))
+        bound.update(kwargs)
+        if bound.get("size_average") is not None or bound.get("reduce") is not None:
+            return NotImplemented
+        from . import _fused_cross_entropy
+
+        if not _fused_cross_entropy.eligible(bound.get("input"), bound.get("target"), bound.get("weight"),
+                                             bound.get("reduction", "mean"), bound.get("label_smoothing", 0.0)):
+            return NotImplemented
+        loss = _fused_cross_entropy.fused(bound["input"], bound["target"], ignore_index=bound.get("ignore_index", -100),
+                                          reduction=bound.get("reduction", "mean"))
+        # torch.nn.functional.cross_entropy returns the input's dtype (the kernel accumulates in float32)
+        return loss if loss.dtype == bound["input"].dtype else loss.to(bound["input"].dtype)
     if function in _ATTENTION:
         from ._plain import plain_range_enabled
 
@@ -66,5 +84,13 @@ def maybe_decompose(function, args, kwargs):
         bound.update(kwargs)
         if not any(isinstance(v, PolyTensor) for v in bound.values()):
             return NotImplemented
+        from . import _fused_attention
+
+        if _fused_attention.eligible(bound["query"], bound["key"], bound["value"], bound.get("attn_mask"),
+                                     bound.get("dropout_p", 0.0), bound.get("is_causal", False),
+                                     bound.get("enable_gqa", False)):
+            return _fused_attention.attention(bound["query"], bound["key"], bound["value"],
+                                              attn_mask=bound.get("attn_mask"), is_causal=bound.get("is_causal", False),
+                                              scale=bound.get("scale"))
         return _attention(**bound)
     return NotImplemented

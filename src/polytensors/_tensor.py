@@ -233,6 +233,62 @@ class PolyTensor(torch.Tensor):
 
     @classmethod
     @contextlib.contextmanager
+    def fused_attention(cls, enabled=True):
+        """Enable or disable the fused degree-1 attention kernels (default: enabled).
+
+        Inside ``plain_range()``, ``torch.nn.functional.scaled_dot_product_attention``
+        on degree-1 real series on CUDA uses flash-style Triton kernels that never
+        form the score matrices and skip masked key blocks: causal attention or a
+        boolean (L, S) mask (e.g. a sliding window), no dropout or GQA, head dim
+        16-128 (16-64 in float64). Other calls use the general series rules. Use
+        ``fused_attention(False)`` to compare against the general rules.
+        """
+
+        from ._fused_attention import _enabled
+
+        token = _enabled.set(bool(enabled))
+        try:
+            yield
+        finally:
+            _enabled.reset(token)
+
+    @staticmethod
+    def cross_entropy(logits, target, softcap=None, ignore_index=-100, reduction="mean"):
+        """Cross entropy of (N, C) logits, optionally capped as ``softcap * tanh(logits / softcap)`` first.
+
+        Accepts ordinary tensors and PolyTensors and returns at least float32. For
+        degree-1 real CUDA series inside ``plain_range()`` one fused Triton pass
+        (forward and backward) applies the cap on the fly, so neither capped nor
+        float32 copies of the logits are formed; other inputs use the composite
+        operations (the cap in at least float32, then
+        ``torch.nn.functional.cross_entropy``).
+        """
+
+        from ._fused_cross_entropy import cross_entropy
+
+        return cross_entropy(logits, target, softcap=softcap, ignore_index=ignore_index, reduction=reduction)
+
+    @classmethod
+    @contextlib.contextmanager
+    def fused_cross_entropy(cls, enabled=True):
+        """Enable or disable the fused degree-1 cross-entropy kernel (default: enabled).
+
+        Inside ``plain_range()``, ``torch.nn.functional.cross_entropy`` on a degree-1
+        real (N, C) series of logits on CUDA with integer class targets (no class
+        weights or label smoothing) uses one streaming Triton pass per row instead of
+        the series log-softmax.
+        """
+
+        from ._fused_cross_entropy import _enabled
+
+        token = _enabled.set(bool(enabled))
+        try:
+            yield
+        finally:
+            _enabled.reset(token)
+
+    @classmethod
+    @contextlib.contextmanager
     def coefficient_autograd(cls):
         """Build an ordinary autograd graph for polynomial coefficients.
 
