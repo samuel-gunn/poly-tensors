@@ -58,7 +58,10 @@ def maybe_decompose(function, args, kwargs):
         bound.update(kwargs)
         if not any(isinstance(bound.get(k), PolyTensor) for k in ("input", "weight")):
             return NotImplemented
-        return _rms_norm(bound["input"], tuple(bound["normalized_shape"]), bound.get("weight"), bound.get("eps"))
+        from . import _fused_norm
+        shape = tuple(bound["normalized_shape"])
+        operation = _fused_norm.rms_norm if _fused_norm.eligible(bound["input"], shape, bound.get("eps")) else _rms_norm
+        return operation(bound["input"], shape, bound.get("weight"), bound.get("eps"))
     if function in _CROSS_ENTROPY:
         # Fused degree-1 rule (otherwise PyTorch decomposes into log_softmax and nll_loss as usual).
         bound = dict(zip(_CROSS_ENTROPY_ARGS, args))

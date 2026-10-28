@@ -117,8 +117,7 @@ inside the same context.
 ## Fused degree-1 kernels (CUDA)
 
 Inside `plain_range()`, degree-1 series with real coefficients on CUDA use fused
-Triton kernels for the two most expensive operations of a transformer, with no
-change to model code:
+Triton kernels for the following operations, with no change to model code:
 
 - `torch.nn.functional.scaled_dot_product_attention`: a flash-style kernel for
   the value and tangent of attention and their exact backward. The L x S score
@@ -129,6 +128,16 @@ change to model code:
 - `torch.nn.functional.cross_entropy` on (N, C) logits with integer targets (no
   class weights or label smoothing): one streaming pass per row, forward and
   backward.
+
+- `torch.nn.functional.rms_norm`: value, tangent and gradient series, for up to
+  8192 elements per normalized row. Multiple trailing dimensions and optional
+  weights are supported.
+- Exact GELU, tanh and sigmoid: value, tangent and native backward operations.
+
+Normalization and activations accumulate half/bfloat16 arithmetic in float32;
+float64 inputs keep float64 arithmetic. This avoids rounding each intermediate
+back to half precision. Coefficient-autograd uses their general differentiable
+rules, and further reverse derivatives remain supported.
 
 `PolyTensor.cross_entropy(logits, target, softcap=None, ignore_index=-100,
 reduction="mean")` adds an optional logit cap `softcap * tanh(logits / softcap)`

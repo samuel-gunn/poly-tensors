@@ -141,7 +141,13 @@ def plain_concatenate(items, operation, dim):
 # sequences of ordinary tensors (coefficient 0 real for a real base).
 
 def _conv(a, b, degree):
-    return [sum(a[i] * b[k - i] for i in range(k + 1)) for k in range(degree + 1)]
+    result = []
+    for k in range(degree + 1):
+        value = a[0] * b[k]
+        for i in range(1, k + 1):
+            value = value + a[i] * b[k - i]
+        result.append(value)
+    return result
 
 
 def plain_exp(X):
@@ -270,6 +276,26 @@ def plain_softmax_family(X, dim):
 def plain_rule(func, args, kwargs, lift, wrap):
     """Plain-range rules for nonlinear operators; NotImplemented if not handled."""
     aten = torch.ops.aten
+    from ._fused_activation import maybe_activation
+    kinds = {aten.gelu.default: "gelu", aten.tanh.default: "tanh", aten.sigmoid.default: "sigmoid",
+             aten.gelu_backward.default: "gelu", aten.tanh_backward.default: "tanh",
+             aten.sigmoid_backward.default: "sigmoid"}
+    if func in kinds:
+        backward = func in (aten.gelu_backward.default, aten.tanh_backward.default, aten.sigmoid_backward.default)
+        approximate = args[2 if backward else 1] if len(args) > (2 if backward else 1) else kwargs.get("approximate", "none")
+        if kinds[func] != "gelu" or approximate == "none":
+            X = lift(args[1] if backward else args[0])
+            result = maybe_activation(X, kinds[func], lift(args[0]) if backward else None)
+            if result is not None:
+                return wrap(result)
+    if func is aten.pow.Tensor_Scalar and args[1] == 2:
+        X = lift(args[0])
+        return wrap(_conv(X, X, len(X) - 1))
+    if func is aten.sqrt.default:
+        X = lift(args[0])
+        if len(X) <= 2:
+            value = torch.sqrt(X[0])
+            return wrap((value,) if len(X) == 1 else (value, X[1] / (2 * value)))
     if func is aten.exp.default:
         return wrap(plain_exp(lift(args[0])))
     if func is aten.log.default:

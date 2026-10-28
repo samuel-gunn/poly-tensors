@@ -135,9 +135,11 @@ def dispatch_range(func, args, kwargs, *, polys, degree, wrap, correct, preserve
         A, B = lift(a), lift(b)
         alpha = kwargs.get("alpha", 1)
         if func in add:
-            result = tuple(x + alpha * y for x, y in zip(A, B))
+            result = (tuple(PlainTensor(torch.add(x.mantissa, y.mantissa, alpha=alpha)) for x, y in zip(A, B))
+                      if plain else tuple(x + alpha * y for x, y in zip(A, B)))
         elif func in sub:
-            result = tuple(x - alpha * y for x, y in zip(A, B))
+            result = (tuple(PlainTensor(torch.sub(x.mantissa, y.mantissa, alpha=alpha)) for x, y in zip(A, B))
+                      if plain else tuple(x - alpha * y for x, y in zip(A, B)))
         elif func in mul:
             result = convolution(A, B)
         else:
